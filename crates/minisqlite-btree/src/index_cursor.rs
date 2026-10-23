@@ -302,7 +302,15 @@ impl<'p> IndexCursor<'p> {
     /// cell. Returns `false` only if `start` is an empty leaf (the empty-tree root).
     fn descend_left_spine(&mut self, start: PageId) -> Result<bool> {
         let mut current = start;
+        let page_limit = u64::from(self.pager.page_count()?);
+        let mut steps: u64 = 0;
         loop {
+            steps += 1;
+                        if steps > page_limit {
+                            return Err(Error::format(
+                                "cursor descent exceeded the database page count (cyclic or corrupt tree)",
+                            ));
+                        }
             let view = PageView::new(self.pager.read_page(current)?, current, self.usable)?;
             if !view.page_type().is_index() {
                 return Err(Error::format("index cursor reached a non-index b-tree page"));
@@ -332,7 +340,15 @@ impl<'p> IndexCursor<'p> {
     /// cell. Returns `false` only if `start` is an empty leaf (the empty-tree root).
     fn descend_right_spine(&mut self, start: PageId) -> Result<bool> {
         let mut current = start;
+        let page_limit = u64::from(self.pager.page_count()?);
+        let mut steps: u64 = 0;
         loop {
+            steps += 1;
+                        if steps > page_limit {
+                            return Err(Error::format(
+                                "cursor descent exceeded the database page count (cyclic or corrupt tree)",
+                            ));
+                        }
             let view = PageView::new(self.pager.read_page(current)?, current, self.usable)?;
             if !view.page_type().is_index() {
                 return Err(Error::format("index cursor reached a non-index b-tree page"));
@@ -364,7 +380,15 @@ impl<'p> IndexCursor<'p> {
         self.stack.clear();
         self.positioned = false;
         let mut current = self.root;
+        let page_limit = u64::from(self.pager.page_count()?);
+        let mut steps: u64 = 0;
         loop {
+            steps += 1;
+                        if steps > page_limit {
+                            return Err(Error::format(
+                                "cursor descent exceeded the database page count (cyclic or corrupt tree)",
+                            ));
+                        }
             let step = {
                 let view = PageView::new(self.pager.read_page(current)?, current, self.usable)?;
                 if !view.page_type().is_index() {

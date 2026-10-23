@@ -270,7 +270,15 @@ impl<'p> TableCursor<'p> {
     fn descend_left_spine(&mut self, start: PageId) -> Result<bool> {
         let pager = self.pager;
         let mut current = start;
+        let page_limit = u64::from(pager.page_count()?);
+        let mut steps: u64 = 0;
         loop {
+            steps += 1;
+                        if steps > page_limit {
+                            return Err(Error::format(
+                                "cursor descent exceeded the database page count (cyclic or corrupt tree)",
+                            ));
+                        }
             let view = PageView::new(pager.read_page(current)?, current, self.usable)?;
             if !view.page_type().is_table() {
                 return Err(Error::format("cursor reached a non-table b-tree page"));
@@ -304,7 +312,15 @@ impl<'p> TableCursor<'p> {
     fn descend_right_spine(&mut self, start: PageId) -> Result<bool> {
         let pager = self.pager;
         let mut current = start;
+        let page_limit = u64::from(pager.page_count()?);
+        let mut steps: u64 = 0;
         loop {
+            steps += 1;
+                        if steps > page_limit {
+                            return Err(Error::format(
+                                "cursor descent exceeded the database page count (cyclic or corrupt tree)",
+                            ));
+                        }
             let view = PageView::new(pager.read_page(current)?, current, self.usable)?;
             if !view.page_type().is_table() {
                 return Err(Error::format("cursor reached a non-table b-tree page"));
@@ -342,7 +358,15 @@ impl<'p> TableCursor<'p> {
         self.positioned = false;
         let pager = self.pager;
         let mut current = self.root;
+        let page_limit = u64::from(pager.page_count()?);
+        let mut steps: u64 = 0;
         loop {
+            steps += 1;
+                        if steps > page_limit {
+                            return Err(Error::format(
+                                "cursor descent exceeded the database page count (cyclic or corrupt tree)",
+                            ));
+                        }
             let step = {
                 let view = PageView::new(pager.read_page(current)?, current, self.usable)?;
                 if !view.page_type().is_table() {
