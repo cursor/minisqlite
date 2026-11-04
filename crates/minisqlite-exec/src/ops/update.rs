@@ -55,7 +55,9 @@ use minisqlite_types::{
 
 use crate::context::EvalCtx;
 use crate::env::{PagerSet, Env, Pagers};
-use crate::ops::constraints::{enforce_checks_over_new_row, enforce_not_null, ConstraintOutcome};
+use crate::ops::constraints::{
+    enforce_checks_over_new_row, enforce_not_null, enforce_strict_types, ConstraintOutcome,
+};
 use crate::ops::foreign_key;
 use crate::ops::dml_index::{
     build_index_plans, delete_index_entries, index_keys_for_plans, insert_index_entries,
@@ -468,6 +470,9 @@ impl UpdateCursor<'_> {
                 ConstraintOutcome::Proceed => {}
                 ConstraintOutcome::Skip => continue,
             }
+            // A STRICT table rejects a value of the wrong type (stricttables.html §2)
+            // under every conflict policy; a no-op for an ordinary table.
+            enforce_strict_types(def, &new_vals)?;
 
             // (6.6) Enforce table/column CHECK constraints over the POST-assignment new row,
             // AFTER NOT NULL and BEFORE the conflict probe and the rewrite. The row-layout
@@ -947,6 +952,8 @@ impl UpdateCursor<'_> {
                 ConstraintOutcome::Proceed => {}
                 ConstraintOutcome::Skip => continue,
             }
+            // A STRICT table rejects a value of the wrong type (stricttables.html §2).
+            enforce_strict_types(def, &new_vals)?;
 
             // (6.6) Enforce CHECK constraints over the post-assignment row. A WR row has no
             // rowid register; `enforce_checks_over_new_row` appends one trailing placeholder

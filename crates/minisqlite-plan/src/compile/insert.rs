@@ -27,7 +27,7 @@ use minisqlite_sql::{
     parse, ConflictClause, Expr, IndexedColumn, IndexedColumnTarget, InsertSource, ResultColumn,
     SelectBody, SelectCore, SetClause, Statement, Upsert, UpsertAction, UpsertTarget,
 };
-use minisqlite_types::{affinity_of_declared_type, Affinity, DbIndex, Error, Result};
+use minisqlite_types::{Affinity, DbIndex, Error, Result};
 
 use crate::bind::scope::is_rowid_keyword;
 use crate::bind::{bind_expr, Scope, Source};
@@ -129,7 +129,7 @@ pub fn compile_insert_with_parent(
 
     // Per-column affinities, in `CREATE TABLE` order (length `N`).
     let column_affinities: Vec<Affinity> =
-        td.columns.iter().map(|c| affinity_of_declared_type(c.declared_type.as_deref())).collect();
+        (0..td.columns.len()).map(|i| td.column_affinity(i)).collect();
 
     // Target columns, the row source, and its width — with the arity check that ties
     // them together (skipped for DEFAULT VALUES, which supplies no values). Any column
@@ -1305,6 +1305,7 @@ mod tests {
             foreign_keys: Vec::new(),
             autoincrement: false,
             primary_key: Vec::new(),
+            strict: false,
         }
     }
 
@@ -2552,6 +2553,7 @@ mod tests {
             foreign_keys: Vec::new(),
             autoincrement: false,
             primary_key: Vec::new(),
+            strict: false,
         };
         let err = plan_against("INSERT INTO w(rowid, a) VALUES (5, 1)", w).unwrap_err();
         match err {
@@ -2586,6 +2588,7 @@ mod tests {
             foreign_keys: Vec::new(),
             autoincrement: false,
             primary_key: Vec::new(),
+            strict: false,
         }
     }
 

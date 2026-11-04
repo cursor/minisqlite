@@ -2114,6 +2114,7 @@ fn sqlite_schema_def() -> TableDef {
         foreign_keys: Vec::new(),
         autoincrement: false,
         primary_key: Vec::new(),
+        strict: false,
     }
 }
 

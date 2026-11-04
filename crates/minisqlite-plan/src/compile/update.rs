@@ -21,7 +21,7 @@ use minisqlite_sql::{
     ConflictClause, Expr, FromClause, JoinKind, JoinOperator, JoinTree, ResultColumn, SetClause,
     TableOrSubquery,
 };
-use minisqlite_types::{affinity_of_declared_type, Affinity, DbIndex, Error, Result};
+use minisqlite_types::{Affinity, DbIndex, Error, Result};
 
 use crate::access::SeqScan;
 use crate::access_path::plan_table_access;
@@ -211,7 +211,7 @@ pub fn compile_update_with_parent(
     crate::compile::select::finalize_tvf_emit_json(&mut scan, &sources);
 
     let column_affinities: Vec<Affinity> =
-        td.columns.iter().map(|c| affinity_of_declared_type(c.declared_type.as_deref())).collect();
+        (0..td.columns.len()).map(|i| td.column_affinity(i)).collect();
 
     let on_conflict = map_on_conflict(stmt.or_conflict);
 
@@ -579,6 +579,7 @@ mod tests {
                 foreign_keys: Vec::new(),
                 autoincrement: false,
                 primary_key: Vec::new(),
+                strict: false,
             }],
         }
     }
@@ -601,6 +602,7 @@ mod tests {
                     foreign_keys: Vec::new(),
                     autoincrement: false,
                     primary_key: Vec::new(),
+                    strict: false,
                 },
                 TableDef {
                     name: "r".to_string(),
@@ -613,6 +615,7 @@ mod tests {
                     foreign_keys: Vec::new(),
                     autoincrement: false,
                     primary_key: Vec::new(),
+                    strict: false,
                 },
             ],
         }
@@ -1096,6 +1099,7 @@ mod tests {
                 foreign_keys: Vec::new(),
                 autoincrement: false,
                 primary_key: Vec::new(),
+                strict: false,
             }],
         }
     }
