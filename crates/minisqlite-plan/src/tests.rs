@@ -89,6 +89,7 @@ fn tdef(name: &str, columns: Vec<ColumnDef>, rowid_alias: Option<usize>) -> Tabl
         foreign_keys: Vec::new(),
         autoincrement: false,
         primary_key: Vec::new(),
+        strict: false,
     }
 }
 

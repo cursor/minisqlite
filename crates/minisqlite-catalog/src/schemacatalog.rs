@@ -2114,6 +2114,7 @@ fn sqlite_schema_def() -> TableDef {
         foreign_keys: Vec::new(),
         autoincrement: false,
         primary_key: Vec::new(),
+        strict: false,
     }
 }
 
@@ -2191,7 +2192,7 @@ fn check_add_column_allowed(coldef: &SqlColumnDef, existing: &[ColumnDef]) -> Re
     }
     if let Some(d) = default {
         let non_constant = match d {
-            DefaultValue::Expr(_) => true,
+            DefaultValue::Expr(..) => true,
             DefaultValue::Literal(lit) => matches!(
                 lit,
                 Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp

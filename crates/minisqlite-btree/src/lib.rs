@@ -29,7 +29,8 @@
 //!
 //! The index b-tree mirrors that structure for key-record (not rowid) pages:
 //!
-//! - [`index_key`] — index-key record comparison (the ordering seeks rely on).
+//! - [`index_key`] — index-key record comparison (the ordering seeks rely on) under
+//!   a per-column [`KeyOrder`] (sort order and collation).
 //! - [`index_nav`] — pure navigation over an index `PageView`.
 //! - [`index_build`] — building and splitting index leaf / interior pages.
 //! - [`index`] — `create_index_btree` and `index_insert` (descent, splice, split
@@ -65,6 +66,7 @@ pub use delete::table_delete;
 pub use insert::table_insert;
 pub use tree::{create_table_btree, init_database};
 
-pub use index::{create_index_btree, index_insert};
+pub use index::{create_index_btree, index_insert, index_insert_with_order};
 pub use index_cursor::IndexCursor;
-pub use index_delete::index_delete;
+pub use index_delete::{index_delete, index_delete_with_order};
+pub use index_key::{KeyField, KeyOrder};

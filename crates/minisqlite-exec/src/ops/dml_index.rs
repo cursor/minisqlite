@@ -41,7 +41,9 @@
 
 use std::cmp::Ordering;
 
-use minisqlite_btree::{index_delete, index_insert, IndexCursor};
+use minisqlite_btree::{
+    index_delete_with_order, index_insert_with_order, IndexCursor, KeyField, KeyOrder,
+};
 use minisqlite_catalog::{Catalog, IndexDef, TableDef};
 use minisqlite_expr::{eval, truth, EvalExpr};
 use minisqlite_fileformat::{decode_record_enc, encode_record_enc, TextEncoding};
@@ -85,6 +87,9 @@ pub(crate) struct WrIndexKey {
     /// order, EXCLUDING every suppressed (already-indexed-with-matching-collation) one.
     /// Empty when the indexed columns already cover the whole PK (§2.5.1's "extreme case").
     trailing: Vec<usize>,
+    /// The sort order and collation of each `trailing` column (1:1): the PRIMARY KEY's own,
+    /// which is how sqlite3 orders the suffix of a WITHOUT ROWID index entry.
+    trailing_fields: Vec<KeyField>,
     /// For each PRIMARY KEY column (in PK order), the position IN A DECODED ENTRY where its
     /// value lives: the indexed-column slot `i` when the column is suppressed (it is present
     /// as indexed column `i`), else `k + t` (k = indexed-column count, t = its slot within
@@ -107,6 +112,12 @@ pub(crate) struct IndexPlan {
     /// probe consults this so a `NOCASE`/`RTRIM` UNIQUE index treats `'abc'` and `'ABC'` as
     /// the same key — a duplicate a BINARY compare would miss.
     pub(crate) collations: Vec<Collation>,
+    /// The index b-tree's key order (sqlite3's `KeyInfo`): one [`KeyField`] per indexed
+    /// column (its `collations` entry and the index's `DESC` flag), then, for a WITHOUT
+    /// ROWID table, one per trailing PRIMARY KEY column carrying the PK's own sort order and
+    /// collation. A rowid table's trailing rowid is past the fields, so it compares
+    /// ascending BINARY. Every write, delete, probe, and read of this index uses it.
+    pub(crate) order: KeyOrder,
     pub(crate) unique: bool,
     pub(crate) detail: String,
     /// `Some` for a WITHOUT ROWID table's index — the trailing-PK suffix layout (§2.5.1) that
@@ -172,15 +183,14 @@ pub(crate) fn build_index_plan(
     partial_predicate: Option<EvalExpr>,
 ) -> Result<IndexPlan> {
     let mut key = Vec::with_capacity(idx.columns.len());
-    let mut collations = Vec::with_capacity(idx.columns.len());
+    // The effective collating sequence and sort order of each key column: an explicit
+    // per-column `COLLATE` written into the index key takes priority; otherwise it inherits
+    // the target column's declared collation, defaulting to BINARY (an expression key with
+    // no explicit override is BINARY — it has no source column to inherit from).
+    let mut fields = index_key_fields(def, idx);
+    let collations: Vec<Collation> = fields.iter().map(|f| f.collation).collect();
     for i in 0..idx.columns.len() {
-        // The effective collating sequence for this key column: an explicit per-column
-        // `COLLATE` written into the index key takes priority; otherwise it inherits the
-        // target column's declared collation, defaulting to BINARY (an expression key with
-        // no explicit override is BINARY — it has no source column to inherit from).
-        let explicit = idx.key_columns.get(i).and_then(|kc| kc.collation.as_deref());
         let part = if let Some(Some(e)) = compiled.get(i) {
-            collations.push(collation_of(explicit));
             IndexKeyPart::Expr(e.clone())
         } else if matches!(idx.key_exprs.get(i), Some(Some(_))) {
             return Err(Error::format(format!(
@@ -199,9 +209,6 @@ pub(crate) fn build_index_plan(
                         idx.name, col, def.name
                     ))
                 })?;
-            // Inherit the column's declared collation when the index states no override.
-            let coll = explicit.or(def.columns[pos].collation.as_deref());
-            collations.push(collation_of(coll));
             IndexKeyPart::Col(pos)
         };
         key.push(part);
@@ -221,7 +228,48 @@ pub(crate) fn build_index_plan(
     // read, and UNIQUE-probe paths share the ONE encoder; a rowid table gets `None` and keeps
     // its byte-identical `[indexed cols.., rowid]` shape.
     let wr = if def.without_rowid { Some(build_wr_index_key(def, idx, &key, &collations)?) } else { None };
-    Ok(IndexPlan { root: idx.root_page, key, collations, unique: idx.unique, detail, wr, partial_predicate })
+    if let Some(wr) = &wr {
+        fields.extend(wr.trailing_fields.iter().copied());
+    }
+    let order = KeyOrder::new(fields);
+    Ok(IndexPlan {
+        root: idx.root_page,
+        key,
+        collations,
+        order,
+        unique: idx.unique,
+        detail,
+        wr,
+        partial_predicate,
+    })
+}
+
+/// The sort order and effective collation of each INDEXED column of `idx` (key order), as
+/// the index b-tree orders it: the index's explicit per-column `COLLATE`, else (for an
+/// ordinary column) the column's declared collation, else BINARY; `DESC` from the index
+/// definition. This is the leading part of every [`IndexPlan::order`], usable on its own by
+/// a reader that has no compiled key expressions (an expression key column's collation
+/// never depends on the expression). A key column naming no column of `def` falls back to
+/// BINARY here; [`build_index_plan`] is the path that rejects such a schema.
+pub(crate) fn index_key_fields(def: &TableDef, idx: &IndexDef) -> Vec<KeyField> {
+    (0..idx.columns.len())
+        .map(|i| {
+            let kc = idx.key_columns.get(i);
+            let explicit = kc.and_then(|kc| kc.collation.as_deref());
+            let inherited = if matches!(idx.key_exprs.get(i), Some(Some(_))) {
+                None
+            } else {
+                def.columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(&idx.columns[i]))
+                    .and_then(|c| c.collation.as_deref())
+            };
+            KeyField {
+                collation: collation_of(explicit.or(inherited)),
+                descending: kc.is_some_and(|kc| kc.descending),
+            }
+        })
+        .collect()
 }
 
 /// Derive a WITHOUT ROWID index's trailing-PK layout ([`WrIndexKey`]) from its resolved key
@@ -254,34 +302,36 @@ fn build_wr_index_key(
         }
     }
     // The PRIMARY KEY columns in PK order (deduped exactly as the WR PK b-tree stores them).
-    let pk = wr_layout(def)?.pk_columns().to_vec();
+    let layout = wr_layout(def)?;
+    let pk = layout.pk_columns().to_vec();
     let mut trailing: Vec<usize> = Vec::new();
+    let mut trailing_fields: Vec<KeyField> = Vec::new();
     let mut pk_entry_positions: Vec<usize> = Vec::with_capacity(pk.len());
-    for &p in &pk {
+    for (j, &p) in pk.iter().enumerate() {
         // A PK column is SUPPRESSED from the suffix when it already appears among the indexed
         // columns with a MATCHING collating sequence (§2.5.1). The PK column's collation is
-        // its declared column collation (BINARY default) — consistent with the BINARY WR key
-        // path (a PK-spec-level explicit `COLLATE` is the same documented follow-up
-        // `WrLayout::pk_conflict_key` notes; not plumbed here).
-        let pk_coll = collation_of(def.columns.get(p).and_then(|c| c.collation.as_deref()));
-        match indexed.iter().position(|(ip, ic)| *ip == p && *ic == pk_coll) {
+        // the PRIMARY KEY clause's explicit `COLLATE`, else its declared column collation
+        // (BINARY default) — the same one the PK b-tree is keyed under.
+        let pk_field = layout.pk_field(j);
+        match indexed.iter().position(|(ip, ic)| *ip == p && *ic == pk_field.collation) {
             // Suppressed: the value is already carried at indexed slot `i`.
             Some(i) => pk_entry_positions.push(i),
             // Kept: appended after the indexed columns at `k + trailing.len()`.
             None => {
                 pk_entry_positions.push(indexed.len() + trailing.len());
                 trailing.push(p);
+                trailing_fields.push(pk_field);
             }
         }
     }
-    Ok(WrIndexKey { trailing, pk_entry_positions })
+    Ok(WrIndexKey { trailing, trailing_fields, pk_entry_positions })
 }
 
 /// Map a key column's declared/overridden `COLLATE` name to a built-in collating sequence,
 /// defaulting to BINARY (datatype3.html §7.1). Only text comparison consults it. Unknown
 /// names default to BINARY here — an unknown collation is rejected at `CREATE INDEX` time,
 /// so a name that survives into an [`IndexDef`] is one of the three built-ins.
-fn collation_of(name: Option<&str>) -> Collation {
+pub(crate) fn collation_of(name: Option<&str>) -> Collation {
     match name {
         Some(n) if n.eq_ignore_ascii_case("NOCASE") => Collation::NoCase,
         Some(n) if n.eq_ignore_ascii_case("RTRIM") => Collation::Rtrim,
@@ -459,7 +509,7 @@ pub(crate) fn insert_index_entries(
     check_keys_match_plans(plans, keys)?;
     for (ip, key) in plans.iter().zip(keys) {
         if let Some(key) = key {
-            index_insert(pager, ip.root, &encode_record_enc(key, enc))?;
+            index_insert_with_order(pager, ip.root, &encode_record_enc(key, enc), &ip.order)?;
         }
     }
     Ok(())
@@ -483,7 +533,7 @@ pub(crate) fn delete_index_entries(
     check_keys_match_plans(plans, keys)?;
     for (ip, key) in plans.iter().zip(keys) {
         if let Some(key) = key {
-            index_delete(pager, ip.root, &encode_record_enc(key, enc))?;
+            index_delete_with_order(pager, ip.root, &encode_record_enc(key, enc), &ip.order)?;
         }
     }
     Ok(())
@@ -492,11 +542,10 @@ pub(crate) fn delete_index_entries(
 /// The rowid of an existing UNIQUE-index entry whose indexed columns equal this row's (at
 /// a rowid other than `rowid`), or `None` if there is no conflict. NULLs are distinct in a
 /// UNIQUE index (sqlite allows any number of NULLs — lang_createindex.html §1.1), so a key
-/// with any NULL indexed column never conflicts. For an all-BINARY key the probe seeks the
-/// shared column prefix and compares the landed entry's columns value-wise (consistent with
-/// the index's own BINARY `compare_index_keys` ordering); a key with a `NOCASE`/`RTRIM`
-/// column instead scans the whole index comparing under each column's collation, because
-/// equal-under-collation keys are not adjacent in the BINARY-ordered b-tree (see the body).
+/// with any NULL indexed column never conflicts. The probe seeks the shared column prefix
+/// under the index's key order and compares the landed entry's columns value-wise under
+/// each column's collation (consistent with the order the b-tree is built on, so keys equal
+/// under a `NOCASE`/`RTRIM` column are adjacent and the seek finds them).
 ///
 /// `key` is the PRECOMPUTED `[indexed cols.., rowid]` record for the plan (from
 /// [`index_key_values`], width `ip.key.len() + 1`); the indexed columns probed are
@@ -536,99 +585,42 @@ pub(crate) fn unique_conflict_rowid(
         }
     }
 
-    // BINARY-only fast path: the index b-tree is ordered by `compare_index_keys` (BINARY),
-    // so every entry sharing this key's indexed prefix is adjacent and `seek_ge(prefix)`
-    // lands on the first of them. The overwhelmingly common case (no `COLLATE` on the key)
-    // stays an O(log n) seek + single-entry check, byte-identical to before.
-    if ip.collations.iter().all(|c| *c == Collation::Binary) {
-        // A prefix key (indexed columns without the rowid) sorts before every full entry
-        // sharing that prefix, so `seek_ge(prefix)` lands on the first candidate. The
-        // probe key is encoded in the database's text encoding so its raw-byte compare in
-        // `seek_ge` lines up with the stored (same-encoding) index keys.
-        let prefix = encode_record_enc(cols, enc);
-        let mut cur = IndexCursor::open(pager, ip.root)?;
-        if !cur.seek_ge(&prefix)? {
-            return Ok(None);
-        }
-        let found = cur.key()?;
-        let decoded = decode_record_enc(&found, enc);
-        if decoded.len() < k + 1 {
-            // A malformed/short index entry: don't manufacture a false conflict.
-            return Ok(None);
-        }
-        for (i, want) in cols.iter().enumerate() {
-            if compare_values(&decoded[i], want, Collation::Binary) != Ordering::Equal {
-                return Ok(None); // The landed entry has a different key prefix.
-            }
-        }
-        // Same indexed values. `decoded[k]` is that entry's rowid; report a conflict only
-        // when it is a DIFFERENT row (a fresh insert's own entry is not written yet, so an
-        // equal prefix is always another row; an UPDATE probes with its own rowid to exclude
-        // its unchanged entry). Every entry this engine writes has an Integer rowid there
-        // (see `index_key_values`); a non-integer means a corrupt index, so fail loud rather
-        // than silently claim or drop a conflict against an unusable rowid.
-        return match &decoded[k] {
-            Value::Integer(existing) if *existing != rowid => Ok(Some(*existing)),
-            Value::Integer(_) => Ok(None),
-            other => Err(Error::format(format!(
-                "corrupt index ({}): entry key has a non-integer rowid slot {other:?}",
-                ip.detail
-            ))),
-        };
-    }
-
-    // Collation-aware path: a `NOCASE`/`RTRIM` key column makes two conflicting keys
-    // (e.g. `'abc'` and `'ABC'` under NOCASE) compare EQUAL yet sort to different places in
-    // the BINARY-ordered b-tree, so they are NOT adjacent and a prefix seek cannot find the
-    // conflict. Walk the whole index and compare each entry's indexed columns under their
-    // per-column collating sequence. This is O(n) per probe — accepted for the uncommon
-    // collated-UNIQUE index, where correctness (rejecting the duplicate real sqlite rejects)
-    // outweighs the seek; the BINARY fast path above keeps the common case O(log n).
-    unique_conflict_collated(pager, ip, cols, rowid, k, enc)
-}
-
-/// Full-index scan for a UNIQUE conflict when any key column has a non-BINARY collation
-/// (see the caller): the b-tree is BINARY-ordered so equal-under-collation keys are not
-/// adjacent, and only a scan comparing each entry under its collation is correct. Returns
-/// the rowid of the first entry whose indexed columns all equal `cols` under their
-/// collations at a DIFFERENT rowid, or `None`.
-fn unique_conflict_collated(
-    pager: &dyn Pager,
-    ip: &IndexPlan,
-    cols: &[Value],
-    rowid: i64,
-    k: usize,
-    enc: TextEncoding,
-) -> Result<Option<i64>> {
-    let mut cur = IndexCursor::open(pager, ip.root)?;
-    if !cur.first()? {
+    // The index b-tree is ordered under the index's own key order (each column's collation
+    // and sort order, `ip.order`), so every entry equal to this key's indexed prefix under
+    // those collations is adjacent and `seek_ge(prefix)` lands on the first of them: an
+    // O(log n) seek + single-entry check for every collation. A prefix key (indexed columns
+    // without the rowid) sorts before every full entry sharing that prefix. The probe key is
+    // encoded in the database's text encoding so its raw-byte compare in `seek_ge` lines up
+    // with the stored (same-encoding) index keys.
+    let prefix = encode_record_enc(cols, enc);
+    let mut cur = IndexCursor::open_with_order(pager, ip.root, ip.order.clone())?;
+    if !cur.seek_ge(&prefix)? {
         return Ok(None);
     }
-    loop {
-        let decoded = decode_record_enc(&cur.key()?, enc);
-        // Skip a malformed/short entry rather than manufacture a false conflict.
-        if decoded.len() >= k + 1 {
-            let all_eq = cols.iter().enumerate().all(|(i, want)| {
-                compare_values(&decoded[i], want, ip.collations[i]) == Ordering::Equal
-            });
-            if all_eq {
-                match &decoded[k] {
-                    // A different row with an equal (under-collation) key: the conflict.
-                    Value::Integer(existing) if *existing != rowid => return Ok(Some(*existing)),
-                    // This row's own entry (UPDATE self-probe): not a conflict, keep scanning.
-                    Value::Integer(_) => {}
-                    other => {
-                        return Err(Error::format(format!(
-                            "corrupt index ({}): entry key has a non-integer rowid slot {other:?}",
-                            ip.detail
-                        )))
-                    }
-                }
-            }
+    let found = cur.key()?;
+    let decoded = decode_record_enc(&found, enc);
+    if decoded.len() < k + 1 {
+        // A malformed/short index entry: don't manufacture a false conflict.
+        return Ok(None);
+    }
+    for (i, want) in cols.iter().enumerate() {
+        if compare_values(&decoded[i], want, ip.collations[i]) != Ordering::Equal {
+            return Ok(None); // The landed entry has a different key prefix.
         }
-        if !cur.next()? {
-            return Ok(None);
-        }
+    }
+    // Same indexed values. `decoded[k]` is that entry's rowid; report a conflict only when
+    // it is a DIFFERENT row (a fresh insert's own entry is not written yet, so an equal
+    // prefix is always another row; an UPDATE probes with its own rowid to exclude its
+    // unchanged entry). Every entry this engine writes has an Integer rowid there (see
+    // `index_key_values`); a non-integer means a corrupt index, so fail loud rather than
+    // silently claim or drop a conflict against an unusable rowid.
+    match &decoded[k] {
+        Value::Integer(existing) if *existing != rowid => Ok(Some(*existing)),
+        Value::Integer(_) => Ok(None),
+        other => Err(Error::format(format!(
+            "corrupt index ({}): entry key has a non-integer rowid slot {other:?}",
+            ip.detail
+        ))),
     }
 }
 
@@ -806,70 +798,27 @@ pub(crate) fn wr_unique_conflict(
             return Ok(None); // A NULL makes the key distinct from every other.
         }
     }
-    // BINARY fast path (mirrors `unique_conflict_rowid`): entries sharing the indexed prefix
-    // are adjacent, so `seek_ge(prefix)` lands on the first; a UNIQUE index holds at most one
-    // entry per indexed prefix, so that first landing is the only candidate.
-    if ip.collations.iter().all(|c| *c == Collation::Binary) {
-        let prefix = encode_record_enc(cols, enc);
-        let mut cur = IndexCursor::open(pager, ip.root)?;
-        if !cur.seek_ge(&prefix)? {
-            return Ok(None);
-        }
-        let decoded = decode_record_enc(&cur.key()?, enc);
-        if decoded.len() < k {
-            return Ok(None); // A malformed/short entry: don't manufacture a false conflict.
-        }
-        for (i, want) in cols.iter().enumerate() {
-            if compare_values(&decoded[i], want, Collation::Binary) != Ordering::Equal {
-                return Ok(None); // The landed entry has a different key prefix.
-            }
-        }
-        return Ok(match wr_reconstruct_pk(wr, &decoded) {
-            Some(found_pk) if !pk_matches(self_pk, &found_pk) => Some(found_pk),
-            _ => None,
-        });
-    }
-    // Collation-aware full scan: same reason as `unique_conflict_collated` — equal-under-
-    // collation keys are not adjacent in the BINARY-ordered b-tree, so a prefix seek can miss.
-    wr_unique_conflict_collated(pager, ip, wr, cols, self_pk, k, enc)
-}
-
-/// Full-index scan for a WR UNIQUE conflict when any indexed column has a non-BINARY
-/// collation (the WR counterpart of [`unique_conflict_collated`]): compare each entry's
-/// indexed columns under their per-column collation, returning the reconstructed PK of the
-/// first equal entry at a different row, or `None`.
-#[allow(clippy::too_many_arguments)]
-fn wr_unique_conflict_collated(
-    pager: &dyn Pager,
-    ip: &IndexPlan,
-    wr: &WrIndexKey,
-    cols: &[Value],
-    self_pk: Option<&[Value]>,
-    k: usize,
-    enc: TextEncoding,
-) -> Result<Option<Vec<Value>>> {
-    let mut cur = IndexCursor::open(pager, ip.root)?;
-    if !cur.first()? {
+    // Mirrors `unique_conflict_rowid`: entries equal to the indexed prefix under the index's
+    // key order are adjacent, so `seek_ge(prefix)` lands on the first; a UNIQUE index holds
+    // at most one entry per indexed prefix, so that first landing is the only candidate.
+    let prefix = encode_record_enc(cols, enc);
+    let mut cur = IndexCursor::open_with_order(pager, ip.root, ip.order.clone())?;
+    if !cur.seek_ge(&prefix)? {
         return Ok(None);
     }
-    loop {
-        let decoded = decode_record_enc(&cur.key()?, enc);
-        if decoded.len() >= k {
-            let all_eq = cols.iter().enumerate().all(|(i, want)| {
-                compare_values(&decoded[i], want, ip.collations[i]) == Ordering::Equal
-            });
-            if all_eq {
-                if let Some(found_pk) = wr_reconstruct_pk(wr, &decoded) {
-                    if !pk_matches(self_pk, &found_pk) {
-                        return Ok(Some(found_pk));
-                    }
-                }
-            }
-        }
-        if !cur.next()? {
-            return Ok(None);
+    let decoded = decode_record_enc(&cur.key()?, enc);
+    if decoded.len() < k {
+        return Ok(None); // A malformed/short entry: don't manufacture a false conflict.
+    }
+    for (i, want) in cols.iter().enumerate() {
+        if compare_values(&decoded[i], want, ip.collations[i]) != Ordering::Equal {
+            return Ok(None); // The landed entry has a different key prefix.
         }
     }
+    Ok(match wr_reconstruct_pk(wr, &decoded) {
+        Some(found_pk) if !pk_matches(self_pk, &found_pk) => Some(found_pk),
+        _ => None,
+    })
 }
 
 /// Delete a WITHOUT ROWID row identified by its full PRIMARY KEY and EVERY one of its
@@ -930,7 +879,7 @@ pub(crate) fn wr_delete_victim_by_pk(
     // REPLACE with FK off is byte-for-byte the removal below.
     foreign_key::enforce_parent_delete(def, &row, catalog, db, &mut *pager, rt)?;
     delete_index_entries(&mut *pager, plans, &keys, enc)?;
-    index_delete(&mut *pager, root, &key_bytes)?;
+    index_delete_with_order(&mut *pager, root, &key_bytes, layout.order())?;
     Ok(())
 }
 
@@ -995,6 +944,7 @@ mod tests {
             root: 0,
             key: positions.iter().map(|&p| IndexKeyPart::Col(p)).collect(),
             collations: positions.iter().map(|_| Collation::Binary).collect(),
+            order: KeyOrder::default(),
             unique: false,
             detail: String::new(),
             wr: None,
@@ -1076,6 +1026,7 @@ mod tests {
                 IndexKeyPart::Expr(EvalExpr::Literal(Value::Integer(7))),
             ],
             collations: vec![Collation::Binary; 4],
+            order: KeyOrder::default(),
             unique: false,
             detail: String::new(),
             wr: None,
@@ -1103,6 +1054,7 @@ mod tests {
             root: 0,
             key: vec![IndexKeyPart::Col(0)],
             collations: vec![Collation::Binary],
+            order: KeyOrder::default(),
             unique: true,
             detail: "t.a".into(),
             wr: None,
@@ -1159,6 +1111,7 @@ mod tests {
             root,
             key: vec![IndexKeyPart::Col(0)],
             collations: vec![Collation::Binary],
+            order: KeyOrder::default(),
             unique: false,
             detail: "t.a".into(),
             wr: None,
@@ -1200,6 +1153,7 @@ mod tests {
             root,
             key: vec![IndexKeyPart::Col(0)],
             collations: vec![Collation::Binary],
+            order: KeyOrder::default(),
             unique: false,
             detail: "t.a".into(),
             wr: None,
@@ -1229,6 +1183,7 @@ mod tests {
             root: 0,
             key: vec![IndexKeyPart::Col(0), IndexKeyPart::Expr(EvalExpr::Literal(Value::Integer(1)))],
             collations: vec![Collation::Binary; 2],
+            order: KeyOrder::default(),
             unique: false,
             detail: String::new(),
             wr: None,
@@ -1266,6 +1221,7 @@ mod tests {
             foreign_keys: Vec::new(),
             autoincrement: false,
             primary_key: Vec::new(),
+            strict: false,
         }
     }
 

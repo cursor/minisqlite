@@ -20,9 +20,9 @@
 //! values per row, which are mapped onto the table's `N` columns (`column_count`) by
 //! `columns` (explicit target list) or positionally (all `N` in `CREATE TABLE` order).
 
-use std::cmp::Ordering;
-
-use minisqlite_btree::{index_delete, index_insert, table_delete, table_insert, TableCursor};
+use minisqlite_btree::{
+    index_delete_with_order, index_insert_with_order, table_delete, table_insert, TableCursor,
+};
 use minisqlite_catalog::{Catalog, TableDef};
 use minisqlite_expr::{eval, truth, EvalExpr};
 use minisqlite_fileformat::{encode_record_enc, TextEncoding};
@@ -30,13 +30,13 @@ use minisqlite_pager::{text_encoding_of, PageId, Pager};
 use minisqlite_plan::{
     ConflictTarget, Insert, OnConflict, Plan, TriggerDmlEvent, UpsertActionPlan, UpsertPlan,
 };
-use minisqlite_types::{
-    apply_affinity, compare_values, Collation, ConstraintKind, Error, Result, Row, Value,
-};
+use minisqlite_types::{apply_affinity, ConstraintKind, Error, Result, Row, Value};
 
 use crate::context::EvalCtx;
 use crate::env::{PagerSet, Env, Pagers};
-use crate::ops::constraints::{enforce_checks_over_new_row, enforce_not_null, ConstraintOutcome};
+use crate::ops::constraints::{
+    enforce_checks_over_new_row, enforce_not_null, enforce_strict_types, ConstraintOutcome,
+};
 use crate::ops::foreign_key;
 use crate::ops::dml_index::{
     build_index_plans, delete_index_entries, index_keys_for_plans, insert_index_entries,
@@ -433,6 +433,9 @@ impl InsertCursor<'_> {
                 ConstraintOutcome::Proceed => {}
                 ConstraintOutcome::Skip => continue,
             }
+            // A STRICT table rejects a value of the wrong type (stricttables.html §2)
+            // under every conflict policy; a no-op for an ordinary table.
+            enforce_strict_types(def, &logical)?;
 
             // (5.6) Enforce table/column CHECK constraints over the new row, AFTER NOT NULL
             // and BEFORE the uniqueness probe and the write. The row-layout choreography —
@@ -883,6 +886,8 @@ impl InsertCursor<'_> {
                 ConstraintOutcome::Proceed => {}
                 ConstraintOutcome::Skip => continue,
             }
+            // A STRICT table rejects a value of the wrong type (stricttables.html §2).
+            enforce_strict_types(def, &logical)?;
 
             // (5.6) Enforce CHECK constraints. A WR table has no rowid register, and its
             // CHECK predicates bind against the width-N row (rowid is hidden on WR, so a
@@ -1052,7 +1057,8 @@ impl InsertCursor<'_> {
             // secondary-index entry. There is no rowid, so `last_insert_rowid()` is left
             // untouched (SQLite's WR rule); the insert is counted once via `record_change`.
             let storage = layout.storage_values(&logical);
-            index_insert(&mut *pager, root, &encode_record_enc(&storage, enc))?;
+            let record = encode_record_enc(&storage, enc);
+            index_insert_with_order(&mut *pager, root, &record, layout.order())?;
             insert_index_entries(&mut *pager, &index_plans, &new_keys, enc)?;
             rt.record_change();
 
@@ -1650,6 +1656,7 @@ fn do_upsert_update(
         ConstraintOutcome::Proceed => {}
         ConstraintOutcome::Skip => return Ok(None),
     }
+    enforce_strict_types(def, &new_vals)?;
     match enforce_checks_over_new_row(
         &node.checks,
         &mut new_vals,
@@ -2071,6 +2078,7 @@ fn do_upsert_update_wr(
         ConstraintOutcome::Proceed => {}
         ConstraintOutcome::Skip => return Ok(None),
     }
+    enforce_strict_types(def, &new_vals)?;
     match enforce_checks_over_new_row(
         &node.checks,
         &mut new_vals,
@@ -2106,7 +2114,7 @@ fn do_upsert_update_wr(
 
     // A PRIMARY KEY change that collides with a DIFFERENT existing row aborts (a same-PK rewrite's
     // only PK match is this row itself, so probe only on a real change).
-    if !wr_pk_equal(&old_pk, &new_pk)
+    if !layout.pk_equal(&old_pk, &new_pk)
         && layout.pk_conflict_key(pagers.source().get(node.db)?, root, &new_pk, enc)?.is_some()
     {
         return Err(pk_conflict_error(def, layout));
@@ -2164,9 +2172,9 @@ fn do_upsert_update_wr(
         rt,
     )?;
     delete_index_entries(&mut *pager, index_plans, &old_keys, enc)?;
-    index_delete(&mut *pager, root, &old_key)?;
+    index_delete_with_order(&mut *pager, root, &old_key, layout.order())?;
     let record = encode_record_enc(&layout.storage_values(&new_vals), enc);
-    index_insert(&mut *pager, root, &record)?;
+    index_insert_with_order(&mut *pager, root, &record, layout.order())?;
     insert_index_entries(&mut *pager, index_plans, &new_keys, enc)?;
     rt.record_change();
 
@@ -2182,12 +2190,3 @@ fn do_upsert_update_wr(
     }
 }
 
-/// Whether two WITHOUT ROWID PRIMARY KEY tuples are the SAME key (per-column `Binary` compare —
-/// the collation the WR b-tree is keyed on; see [`WrLayout::pk_conflict_key`]). Kept local to the
-/// INSERT op (the UPDATE op has an identical private `pk_equal`) so this path stays independent of
-/// the sibling WR write paths — the small duplication is deliberate, matching the per-op
-/// `pk_conflict_error` convention.
-fn wr_pk_equal(a: &[Value], b: &[Value]) -> bool {
-    a.len() == b.len()
-        && a.iter().zip(b).all(|(x, y)| compare_values(x, y, Collation::Binary) == Ordering::Equal)
-}

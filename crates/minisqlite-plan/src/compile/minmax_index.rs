@@ -34,7 +34,7 @@
 
 use minisqlite_catalog::{Catalog, IndexDef, TableDef};
 use minisqlite_expr::EvalExpr;
-use minisqlite_types::{affinity_of_declared_type, Affinity, Collation};
+use minisqlite_types::{Affinity, Collation};
 
 use crate::access::SeqScan;
 use crate::access_path::{col_reg, key_column_is_binary};
@@ -128,8 +128,7 @@ fn seek_plan(
     if i >= n {
         return None;
     }
-    let col = &table.columns[i];
-    if affinity_of_declared_type(col.declared_type.as_deref()) == Affinity::Blob {
+    if table.column_affinity(i) == Affinity::Blob {
         return None;
     }
     // A catalog `Err` here DECLINES (`.ok()?` -> keep the full-scan Aggregate) rather than
@@ -162,7 +161,7 @@ fn index_leftmost_serves(ix: &IndexDef, table: &TableDef, n: usize, want_col: us
     if matches!(ix.key_exprs.first(), Some(Some(_))) {
         return false;
     }
-    if kc.descending || !key_column_is_binary(kc) {
+    if kc.descending || !key_column_is_binary(kc, table, name) {
         return false;
     }
     matches!(col_reg(table, name, n), Some(r) if r == want_col)
@@ -252,6 +251,7 @@ mod tests {
             foreign_keys: Vec::new(),
             autoincrement: false,
             primary_key: Vec::new(),
+            strict: false,
         }
     }
 

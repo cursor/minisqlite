@@ -40,22 +40,23 @@
 //! ASSIGNED values only — an unassigned column keeps its already-stored
 //! (already-affinity-applied) value.
 
-use std::cmp::Ordering;
 use std::collections::HashSet;
 
-use minisqlite_btree::{index_delete, index_insert, table_delete, table_insert, TableCursor};
+use minisqlite_btree::{
+    index_delete_with_order, index_insert_with_order, table_delete, table_insert, TableCursor,
+};
 use minisqlite_catalog::{Catalog, TableDef};
 use minisqlite_expr::eval;
 use minisqlite_fileformat::{encode_record_enc, TextEncoding};
 use minisqlite_pager::{text_encoding_of, PageId, Pager};
 use minisqlite_plan::{GeneratedProgram, OnConflict, Plan, TriggerDmlEvent, Update};
-use minisqlite_types::{
-    apply_affinity, compare_values, Collation, ConstraintKind, DbIndex, Error, Result, Row, Value,
-};
+use minisqlite_types::{apply_affinity, ConstraintKind, DbIndex, Error, Result, Row, Value};
 
 use crate::context::EvalCtx;
 use crate::env::{PagerSet, Env, Pagers};
-use crate::ops::constraints::{enforce_checks_over_new_row, enforce_not_null, ConstraintOutcome};
+use crate::ops::constraints::{
+    enforce_checks_over_new_row, enforce_not_null, enforce_strict_types, ConstraintOutcome,
+};
 use crate::ops::foreign_key;
 use crate::ops::dml_index::{
     build_index_plans, delete_index_entries, index_keys_for_plans, insert_index_entries,
@@ -468,6 +469,9 @@ impl UpdateCursor<'_> {
                 ConstraintOutcome::Proceed => {}
                 ConstraintOutcome::Skip => continue,
             }
+            // A STRICT table rejects a value of the wrong type (stricttables.html §2)
+            // under every conflict policy; a no-op for an ordinary table.
+            enforce_strict_types(def, &new_vals)?;
 
             // (6.6) Enforce table/column CHECK constraints over the POST-assignment new row,
             // AFTER NOT NULL and BEFORE the conflict probe and the rewrite. The row-layout
@@ -831,7 +835,7 @@ impl UpdateCursor<'_> {
             // a REPLACE cascade like `UPDATE OR REPLACE t SET pk=pk+1` collapses correctly).
             // The target window is spliced back so an `UPDATE ... FROM` row keeps its FROM cols.
             let refreshed: Option<Row> = if matches!(node.on_conflict, OnConflict::Replace)
-                && pk_in(&invalidated, &old_pk)
+                && pk_in(&layout, &invalidated, &old_pk)
             {
                 match read_live_wr_row(
                     self.pagers.source().get(node.db)?,
@@ -947,6 +951,8 @@ impl UpdateCursor<'_> {
                 ConstraintOutcome::Proceed => {}
                 ConstraintOutcome::Skip => continue,
             }
+            // A STRICT table rejects a value of the wrong type (stricttables.html §2).
+            enforce_strict_types(def, &new_vals)?;
 
             // (6.6) Enforce CHECK constraints over the post-assignment row. A WR row has no
             // rowid register; `enforce_checks_over_new_row` appends one trailing placeholder
@@ -1039,7 +1045,7 @@ impl UpdateCursor<'_> {
             let mut skip = false;
             // PRIMARY KEY: only a real PK change can collide with a DIFFERENT row (a same-PK
             // rewrite's only match is this row itself).
-            if !pk_equal(&old_pk, &new_pk)
+            if !layout.pk_equal(&old_pk, &new_pk)
                 && layout.pk_conflict_key(&*pager, root, &new_pk, enc)?.is_some()
             {
                 match node.on_conflict {
@@ -1114,9 +1120,9 @@ impl UpdateCursor<'_> {
             // keeps a same-PK rewrite from holding a stale duplicate; moving the secondary
             // entries (old → new) reflects both an indexed-column change and a PK change.
             delete_index_entries(&mut *pager, &index_plans, &old_keys, enc)?;
-            index_delete(&mut *pager, root, &old_key)?;
+            index_delete_with_order(&mut *pager, root, &old_key, layout.order())?;
             let record = encode_record_enc(&layout.storage_values(&new_vals), enc);
-            index_insert(&mut *pager, root, &record)?;
+            index_insert_with_order(&mut *pager, root, &record, layout.order())?;
             insert_index_entries(&mut *pager, &index_plans, &new_keys, enc)?;
             rt.record_change();
 
@@ -1365,20 +1371,11 @@ fn read_live_wr_row(
     Ok(Some(row))
 }
 
-/// Whether two PRIMARY KEY value tuples are the SAME key, compared per column under
-/// `Binary` — the collation the WITHOUT ROWID b-tree is keyed on (see
-/// [`WrLayout::pk_conflict_key`]), so "the PK changed" here agrees with whether a rewrite
-/// lands in a different b-tree slot. A `TEXT COLLATE NOCASE` PK is the documented follow-up
-/// noted on `pk_conflict_key` (the whole WR key path is Binary today), so this stays Binary.
-fn pk_equal(a: &[Value], b: &[Value]) -> bool {
-    a.len() == b.len()
-        && a.iter().zip(b).all(|(x, y)| compare_values(x, y, Collation::Binary) == Ordering::Equal)
-}
-
 /// Whether `pk` matches any PRIMARY KEY in `victims` (the PKs deleted as REPLACE victims
-/// this statement), under the same `Binary` per-column compare as [`pk_equal`].
-fn pk_in(victims: &[Vec<Value>], pk: &[Value]) -> bool {
-    victims.iter().any(|v| pk_equal(v, pk))
+/// this statement), under [`WrLayout::pk_equal`] — the per-column collation the WITHOUT ROWID
+/// b-tree is keyed on, so "same key" here agrees with which b-tree slot a key lands in.
+fn pk_in(layout: &WrLayout, victims: &[Vec<Value>], pk: &[Value]) -> bool {
+    victims.iter().any(|v| layout.pk_equal(v, pk))
 }
 
 /// The error for a duplicate PRIMARY KEY in a WITHOUT ROWID table: a `PRIMARY KEY`

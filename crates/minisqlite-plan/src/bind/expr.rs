@@ -1962,6 +1962,7 @@ mod tests {
                 foreign_keys: Vec::new(),
                 autoincrement: false,
                 primary_key: Vec::new(),
+                strict: false,
             }],
         }
     }

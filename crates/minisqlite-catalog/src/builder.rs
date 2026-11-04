@@ -206,6 +206,7 @@ pub(crate) fn table_def_from_ast(stmt: &CreateTable, root_page: PageId) -> Resul
         foreign_keys,
         autoincrement,
         primary_key,
+        strict: options.strict,
     })
 }
 
@@ -1069,8 +1070,9 @@ fn validate_foreign_key_child_columns(
 /// must declare a datatype (`missing datatype for <t>.<c>`), and that datatype must be
 /// exactly one of the six [`STRICT_DATATYPES`], compared ASCII case-insensitively against
 /// the WHOLE declared type text (`unknown datatype for <t>.<c>: "<TYPE>"`). This is the
-/// create-time half only; runtime STRICT type enforcement on INSERT (an
-/// `SQLITE_CONSTRAINT_DATATYPE`) is a separate slice. A non-STRICT table is unrestricted —
+/// create-time half only; the flag is recorded as [`TableDef::strict`] and the runtime half
+/// (rejecting a value of the wrong type on INSERT/UPDATE) is the executor's
+/// `enforce_strict_types`. A non-STRICT table is unrestricted —
 /// any type, or none, is legal — so this is a no-op unless `strict`.
 fn validate_strict_datatypes(
     table_name: &str,
@@ -1365,7 +1367,7 @@ fn expr_contains_subquery(root: &Expr) -> bool {
 fn validate_constant_defaults(columns: &[SqlColumnDef]) -> Result<()> {
     for c in columns {
         for cons in &c.constraints {
-            if let ColumnConstraintKind::Default(DefaultValue::Expr(e)) = &cons.kind {
+            if let ColumnConstraintKind::Default(DefaultValue::Expr(e, _)) = &cons.kind {
                 if !default_expr_is_constant(e) {
                     return Err(Error::Sql(format!(
                         "default value of column [{}] is not constant",
@@ -1405,12 +1407,11 @@ pub(crate) fn has_autoincrement(stmt: &CreateTable) -> bool {
     matches!(&stmt.body, CreateTableBody::Columns { columns, .. } if autoincrement_column(columns).is_some())
 }
 
-/// Best-effort raw-SQL text for a column `DEFAULT`. A literal is rendered exactly
-/// (this is what a reload needs, and what the INSERT planner re-binds when a row
-/// omits the column). A parenthesized bare double-quoted `DEFAULT ("lit")` is a DQS
-/// text literal (see the `DefaultValue::Expr` arm below); any *other* non-literal
-/// `DEFAULT (expr)` is not reconstructed here (`None`) — faithful expression
-/// rendering is a later refinement. The un-parenthesized `DEFAULT "lit"` never
+/// Raw-SQL text for a column `DEFAULT`. A literal is rendered exactly (this is what a
+/// reload needs, and what the INSERT planner re-binds when a row omits the column). A
+/// parenthesized bare double-quoted `DEFAULT ("lit")` is a DQS text literal (see the
+/// `DefaultValue::Expr` arm below); any *other* `DEFAULT (expr)` uses the expression's
+/// source text as the parser kept it, like sqlite3's `dflt_value`. The un-parenthesized `DEFAULT "lit"` never
 /// reaches here as an expression: `parse_default_value` already folds it to a
 /// `DefaultValue::Literal(Text)` in the parser.
 fn render_default_text(d: &DefaultValue) -> Option<String> {
@@ -1420,14 +1421,15 @@ fn render_default_text(d: &DefaultValue) -> Option<String> {
         // `DEFAULT ("lit")` names no column (a column default has no row to read), so it
         // is the text literal 'lit'. Render it single-quoted so a schema reload / the
         // INSERT planner re-parses it as exactly that string literal. Any other
-        // expression default remains un-reconstructed (`None`).
-        DefaultValue::Expr(e) => match e.as_ref() {
+        // expression default keeps its source text, which is what sqlite3 stores and
+        // reports, and which the INSERT planner re-parses as the expression.
+        DefaultValue::Expr(e, text) => match e.as_ref() {
             // Reuse `render_literal` so the single-quote text-escaping rule lives in ONE
             // place (a bare DQS default is exactly the text literal of its spelling).
             Expr::Column { schema: None, table: None, name, from_dqs: true } => {
                 Some(render_literal(&Literal::Text(name.clone())))
             }
-            _ => None,
+            _ => Some(text.clone()),
         },
     }
 }
@@ -1445,7 +1447,7 @@ fn eval_constant_default(d: &DefaultValue) -> Option<Value> {
         // DQS legacy: a parenthesized bare double-quoted default `DEFAULT ("lit")` folds
         // to the constant text 'lit' (mirrors render_default_text). Every other expression
         // default has no build-time constant here.
-        DefaultValue::Expr(e) => {
+        DefaultValue::Expr(e, _) => {
             return match e.as_ref() {
                 Expr::Column { schema: None, table: None, name, from_dqs: true } => {
                     Some(Value::Text(name.clone()))
@@ -1495,6 +1497,7 @@ fn render_literal(lit: &Literal) -> String {
 mod tests {
     use super::*;
     use minisqlite_sql::{parse, BinaryOp, Statement};
+    use minisqlite_types::Affinity;
 
     /// Parse a single `CREATE TABLE` and build its def with a fixed root page.
     fn tdef(sql: &str) -> TableDef {
@@ -1801,8 +1804,16 @@ mod tests {
             tdef("CREATE TABLE t(a TEXT DEFAULT CURRENT_TIMESTAMP)").columns[0].default.as_deref(),
             Some("CURRENT_TIMESTAMP")
         );
-        // A parenthesized expression default is not reconstructed (deferred): None.
-        assert_eq!(tdef("CREATE TABLE t(a INT DEFAULT (1+2))").columns[0].default, None);
+        // A parenthesized expression default keeps the source text between the
+        // parentheses, outer whitespace trimmed, as sqlite3's `dflt_value` shows it.
+        assert_eq!(
+            tdef("CREATE TABLE t(a INT DEFAULT (1+2))").columns[0].default.as_deref(),
+            Some("1+2")
+        );
+        assert_eq!(
+            tdef("CREATE TABLE t(a TEXT DEFAULT (  'a' ||  'b' ))").columns[0].default.as_deref(),
+            Some("'a' ||  'b'")
+        );
     }
 
     #[test]
@@ -1844,6 +1855,20 @@ mod tests {
         let t = tdef("CREATE TABLE t(x INTEGER PRIMARY KEY) WITHOUT ROWID");
         assert!(t.without_rowid);
         assert_eq!(t.rowid_alias, None);
+    }
+
+    #[test]
+    fn strict_records_the_flag_and_any_has_no_affinity() {
+        // The flag reaches the def (with and without WITHOUT ROWID), and an `ANY` column
+        // of a STRICT table has no affinity while an ordinary table's `ANY` is NUMERIC.
+        let t = tdef("CREATE TABLE t(a ANY, b INT) STRICT");
+        assert!(t.strict);
+        assert_eq!(t.column_affinity(0), Affinity::Blob);
+        assert_eq!(t.column_affinity(1), Affinity::Integer);
+        assert!(tdef("CREATE TABLE w(k INT PRIMARY KEY) STRICT, WITHOUT ROWID").strict);
+        let n = tdef("CREATE TABLE n(a ANY)");
+        assert!(!n.strict);
+        assert_eq!(n.column_affinity(0), Affinity::Numeric);
     }
 
     // --- AUTOINCREMENT restrictions (autoinc.html §3) --------------------------
@@ -2818,12 +2843,11 @@ mod tests {
 
     #[test]
     fn accepted_expression_default_materialization_is_unchanged() {
-        // The accept path must be UNCHANGED, not merely non-erroring: a constant expression
-        // default still renders to no raw text and folds to no constant Value
-        // (`render_default_text` / `eval_constant_default` are untouched). Pins the behavior
-        // the constant-validator must not disturb (mirrors the pre-existing `(1+2)` asserts).
+        // The accept path must not be disturbed by the constant-validator: a constant
+        // expression default keeps its source text (re-parsed by the INSERT planner) and
+        // folds to no build-time constant Value.
         let t = tdef("CREATE TABLE t(a, b DEFAULT (1+2))");
-        assert_eq!(t.columns[1].default, None);
+        assert_eq!(t.columns[1].default.as_deref(), Some("1+2"));
         assert!(t.columns[1].default_value.is_none());
     }
 

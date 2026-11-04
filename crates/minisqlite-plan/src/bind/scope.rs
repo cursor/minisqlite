@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use minisqlite_catalog::{ColumnDef, TableDef};
 use minisqlite_expr::{AggregateCall, EvalExpr};
 use minisqlite_sql::{Expr, WindowSpec};
-use minisqlite_types::{affinity_of_declared_type, Affinity, Collation, DbIndex, Error, Result};
+use minisqlite_types::{Affinity, Collation, DbIndex, Error, Result};
 
 use crate::plan::WindowFunc;
 
@@ -1198,7 +1198,7 @@ fn base_column_meta(table: &TableDef, i: usize) -> Result<(Affinity, Collation)>
     let affinity = if table.rowid_alias == Some(i) {
         Affinity::Integer
     } else {
-        affinity_of_declared_type(col.declared_type.as_deref())
+        table.column_affinity(i)
     };
     Ok((affinity, collation_of(col)?))
 }
@@ -1317,6 +1317,7 @@ mod tests {
     //! plan side of the plan<->exec WR row-width contract and a regression to N+1 would
     //! otherwise stay green.
     use super::*;
+    use minisqlite_types::affinity_of_declared_type;
 
     /// A derived column with NONE affinity / BINARY collation — the typeless case these
     /// register/width tests exercise (affinity/collation are irrelevant to the register
@@ -1495,6 +1496,7 @@ mod tests {
             foreign_keys: Vec::new(),
             autoincrement: false,
             primary_key: Vec::new(),
+            strict: false,
         }
     }
 

@@ -111,7 +111,7 @@ pub(crate) fn satisfy_order_by(
     let direction = uniform_direction(keys)?;
 
     // Every key must sort under Binary (F1) — a NOCASE / RTRIM / explicit-COLLATE term
-    // cannot be served by the Binary-ordered b-tree — and its NULL placement must match
+    // cannot be served by a BINARY-ordered key column — and its NULL placement must match
     // the scan's natural one (F2).
     if !keys.iter().all(|k| k.collation == Collation::Binary) {
         return None;
@@ -391,7 +391,7 @@ fn index_run_serves_order(
         }
         // Ascending + Binary only (F1 / F4): a DESC or non-Binary key column would not
         // walk in the ORDER BY's ascending Binary order.
-        if kc.descending || !key_column_is_binary(kc) {
+        if kc.descending || !key_column_is_binary(kc, td, name) {
             return false;
         }
         // The index key column must be the SAME base column the ORDER BY key traced to.
@@ -504,6 +504,7 @@ mod tests {
             foreign_keys: Vec::new(),
             autoincrement: false,
             primary_key: Vec::new(),
+            strict: false,
         }
     }
 

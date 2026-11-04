@@ -332,6 +332,7 @@ fn synth_table(view: &ViewDef, cols: &[ViewCol]) -> TableDef {
         foreign_keys: Vec::new(),
         autoincrement: false,
         primary_key: Vec::new(),
+        strict: false,
     }
 }
 
@@ -708,6 +709,7 @@ mod tests {
             foreign_keys: Vec::new(),
             autoincrement: false,
             primary_key: Vec::new(),
+            strict: false,
         }
     }
 

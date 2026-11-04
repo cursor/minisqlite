@@ -22,7 +22,7 @@ use minisqlite_fileformat::PageView;
 use minisqlite_pager::Pager;
 use minisqlite_types::{Error, Result};
 
-use crate::index_key::{cell_key_bytes, compare_index_keys};
+use crate::index_key::{cell_key_bytes, compare_index_keys, KeyOrder};
 
 /// Choose the child to descend into for `search_key` on an interior index page.
 /// Returns `(child_page, pointer_index)` where `pointer_index` is the position of
@@ -39,6 +39,7 @@ pub(crate) fn index_choose_child(
     view: &PageView,
     search_key: &[u8],
     usable: usize,
+    order: &KeyOrder,
 ) -> Result<(u32, u32)> {
     let count = view.cell_count() as usize;
     let (mut lo, mut hi) = (0usize, count);
@@ -47,7 +48,7 @@ pub(crate) fn index_choose_child(
         let cell = view.index_interior_cell(mid)?;
         let key = cell_key_bytes(pager, cell.local_payload, cell.payload_len, cell.overflow_page, usable)?;
         // First cell with search_key <= K, i.e. compare(search_key, K) is not Greater.
-        if compare_index_keys(search_key, key.as_ref()) != Ordering::Greater {
+        if compare_index_keys(search_key, key.as_ref(), order) != Ordering::Greater {
             hi = mid;
         } else {
             lo = mid + 1;
@@ -82,7 +83,8 @@ fn right_pointer(view: &PageView) -> Result<u32> {
 /// Binary search a leaf index page for `search_key`. `Ok(i)` = an exact full-key
 /// match at cell `i`; `Err(pos)` = absent, and `pos` is the first cell index whose
 /// key is `> search_key` (the insertion point, and the landing point for a `>=`
-/// seek). Leaf cells are ascending under [`compare_index_keys`]. `pager`/`usable`
+/// seek). Leaf cells are ascending under [`compare_index_keys`] with `order` (the
+/// tree's [`KeyOrder`]). `pager`/`usable`
 /// let an overflowed leaf key be reassembled before comparison (see
 /// `index_choose_child`).
 pub(crate) fn index_leaf_search(
@@ -90,6 +92,7 @@ pub(crate) fn index_leaf_search(
     view: &PageView,
     search_key: &[u8],
     usable: usize,
+    order: &KeyOrder,
 ) -> Result<core::result::Result<usize, usize>> {
     let count = view.cell_count() as usize;
     let (mut lo, mut hi) = (0usize, count);
@@ -97,7 +100,7 @@ pub(crate) fn index_leaf_search(
         let mid = lo + (hi - lo) / 2;
         let cell = view.index_leaf_cell(mid)?;
         let key = cell_key_bytes(pager, cell.local_payload, cell.payload_len, cell.overflow_page, usable)?;
-        match compare_index_keys(search_key, key.as_ref()) {
+        match compare_index_keys(search_key, key.as_ref(), order) {
             Ordering::Equal => return Ok(Ok(mid)),
             Ordering::Less => hi = mid,
             Ordering::Greater => lo = mid + 1,
