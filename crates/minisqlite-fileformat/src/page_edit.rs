@@ -311,42 +311,70 @@ fn free_region(
     }
 }
 
-/// Splice a freeblock of `size` bytes at `off` into the offset-sorted freeblock chain
-/// (no coalescing — a non-merged chain is still spec-valid, and [`defragment`]
-/// reclaims it wholesale when space is next needed). `size >= 4` is the caller's
+/// Splice a freeblock of `size` bytes at `off` into the offset-sorted freeblock chain,
+/// merging it with a neighbouring freeblock that it touches or that is at most 3 bytes
+/// away. Bytes between merged blocks were fragments, so they leave the fragmented-byte
+/// count. This is what sqlite3's `freeSpace()` does, and sqlite3's page checks reject a
+/// chain where one freeblock starts within 3 bytes of the end of the previous one, so
+/// an unmerged pair makes the page corrupt for sqlite3. `size >= 4` is the caller's
 /// contract (a smaller hole is fragmented, not chained).
 fn insert_freeblock(page: &mut [u8], h: usize, off: usize, size: usize, usable: usize) -> Result<()> {
-    let head = be16(page, h + HDR_FIRST_FREEBLOCK) as usize;
-    if head == 0 || off < head {
-        write_be16(page, off, head as u16); // this block's next = old head
-        write_be16(page, off + 2, size as u16);
-        write_be16(page, h + HDR_FIRST_FREEBLOCK, off as u16);
-        return Ok(());
-    }
-    if off == head {
-        return Err(Error::format("freeing an already-free block (double free, corrupt page)"));
-    }
-    // Walk to the last block whose offset is < off.
-    let mut prev = head;
+    // Find the neighbours: `prev` is the last freeblock below `off` (0 = none, the
+    // header slot links the chain) and `next` the first one above it.
+    let mut prev = 0usize;
+    let mut next = be16(page, h + HDR_FIRST_FREEBLOCK) as usize;
     let mut guard = usable / 4 + 1;
-    loop {
-        let next = be16(page, prev) as usize;
-        if next == 0 || next > off {
-            break;
-        }
-        if next == off {
-            return Err(Error::format("freeing an already-free block (double free, corrupt page)"));
-        }
+    while next != 0 && next < off {
         if guard == 0 {
             return Err(Error::format("freeblock chain too long (corrupt page)"));
         }
         guard -= 1;
         prev = next;
+        next = be16(page, next) as usize;
     }
-    let prev_next = be16(page, prev) as usize;
-    write_be16(page, off, prev_next as u16);
-    write_be16(page, off + 2, size as u16);
-    write_be16(page, prev, off as u16);
+    if next == off {
+        return Err(Error::format("freeing an already-free block (double free, corrupt page)"));
+    }
+
+    let mut start = off;
+    let mut end = off + size;
+    let mut absorbed = 0usize;
+    if next != 0 {
+        if next < end {
+            return Err(Error::format("freed cell overlaps a freeblock (corrupt page)"));
+        }
+        if next <= end + 3 {
+            absorbed += next - end;
+            end = next + be16(page, next + 2) as usize;
+            next = be16(page, next) as usize;
+        }
+    }
+    if prev != 0 {
+        let prev_end = prev + be16(page, prev + 2) as usize;
+        if prev_end > start {
+            return Err(Error::format("freed cell overlaps a freeblock (corrupt page)"));
+        }
+        if prev_end + 3 >= start {
+            absorbed += start - prev_end;
+            start = prev;
+        }
+    }
+    let frag = page[h + HDR_FRAG] as usize;
+    if absorbed > frag {
+        return Err(Error::format("fragmented-byte count too small for the gap between freeblocks (corrupt page)"));
+    }
+    page[h + HDR_FRAG] = (frag - absorbed) as u8;
+
+    write_be16(page, start, next as u16);
+    write_be16(page, start + 2, (end - start) as u16);
+    if start != prev {
+        // Not folded into `prev`: link the new block in after it (or as the head).
+        if prev == 0 {
+            write_be16(page, h + HDR_FIRST_FREEBLOCK, start as u16);
+        } else {
+            write_be16(page, prev, start as u16);
+        }
+    }
     Ok(())
 }
 
@@ -482,11 +510,16 @@ mod tests {
         // Freeblock chain: well-formed, disjoint from cells, inside the content area.
         let mut fb = be16(page, h + HDR_FIRST_FREEBLOCK) as usize;
         let mut prev = 0usize;
+        let mut prev_end = 0usize;
         let mut guard = USABLE;
         while fb != 0 {
             assert!(guard > 0, "freeblock chain terminates");
             guard -= 1;
             assert!(fb > prev, "freeblocks offset-sorted");
+            // sqlite3 treats a freeblock that starts within 3 bytes of the end of the
+            // previous one as a corrupt page (`free space corruption`), so neighbours
+            // must be merged.
+            assert!(prev == 0 || fb > prev_end + 3, "freeblock at {fb} not merged with the one ending at {prev_end}");
             let size = be16(page, fb + 2) as usize;
             assert!(size >= 4, "freeblock at least 4 bytes");
             assert!(fb >= content_start && fb + size <= USABLE, "freeblock within content area");
@@ -495,8 +528,55 @@ mod tests {
                 *b = true;
             }
             prev = fb;
+            prev_end = fb + size;
             fb = be16(page, fb) as usize;
         }
+    }
+
+    /// Five sequential rowids, packed from the end of the page, so cells for rowids 2
+    /// and 3 sit next to each other below the cell for rowid 1.
+    fn five_cell_page() -> (Vec<u8>, Vec<Entry>) {
+        let mut page = empty_table_page();
+        let mut model = Vec::new();
+        for rowid in 1..=5i64 {
+            model_insert(&mut page, 3, &mut model, rowid, table_cell(rowid, rowid * 10));
+        }
+        (page, model)
+    }
+
+    /// Delete the cells for `rowids` one at a time and check that their space ends up
+    /// as ONE freeblock covering both.
+    fn assert_neighbours_merge(rowids: [i64; 2]) {
+        let (mut page, mut model) = five_cell_page();
+        let freed: usize = model
+            .iter()
+            .filter(|e| rowids.contains(&e.rowid))
+            .map(|e| e.cell.len())
+            .sum();
+        for rowid in rowids {
+            let pos = model.iter().position(|e| e.rowid == rowid).unwrap();
+            delete_cell(&mut page, 3, USABLE, pos).unwrap();
+            model.remove(pos);
+        }
+        assert_valid(&page, 3, &model);
+        let h = header_offset_for(3);
+        let fb = be16(&page, h + HDR_FIRST_FREEBLOCK) as usize;
+        assert_ne!(fb, 0, "the freed cells form a freeblock");
+        assert_eq!(be16(&page, fb), 0, "one freeblock, not a chain of two");
+        assert_eq!(be16(&page, fb + 2) as usize, freed, "the freeblock covers both cells");
+        assert_eq!(page[h + HDR_FRAG], 0, "no fragmented bytes");
+    }
+
+    #[test]
+    fn freeing_a_cell_below_a_freeblock_merges_with_it() {
+        // Rowid 3's cell ends where the freeblock left by rowid 2 starts.
+        assert_neighbours_merge([2, 3]);
+    }
+
+    #[test]
+    fn freeing_a_cell_above_a_freeblock_merges_with_it() {
+        // Rowid 2's cell starts where the freeblock left by rowid 3 ends.
+        assert_neighbours_merge([3, 2]);
     }
 
     #[test]
