@@ -8,7 +8,7 @@
 
 use minisqlite_pager::PageId;
 use minisqlite_sql::Expr;
-use minisqlite_types::Value;
+use minisqlite_types::{affinity_of_declared_type, Affinity, Value};
 
 // Re-exported so `ForeignKeyDef` (below) is usable by downstream crates naming the
 // `on_delete` / `on_update` action without a direct `minisqlite-sql` dependency. The
@@ -134,6 +134,27 @@ pub struct TableDef {
     /// of PK-column order, so `PRAGMA table_info.pk` positions and `index_list.origin='pk'` do
     /// not have to reverse-engineer the key from the per-column flag + auto-index specs.
     pub primary_key: Vec<usize>,
+    /// True when the table was declared with the trailing `STRICT` option
+    /// (`stricttables.html`). The builder has already checked that every column declares
+    /// one of the six STRICT datatypes; the executor uses this flag to reject a value of
+    /// the wrong type on INSERT/UPDATE, and [`TableDef::column_affinity`] uses it to give
+    /// an `ANY` column no affinity.
+    pub strict: bool,
+}
+
+impl TableDef {
+    /// The affinity of `columns[i]` as a stored value or comparison operand: the
+    /// declared-type affinity (`datatype3.html` §3.1), except that an `ANY` column of a
+    /// STRICT table has none (BLOB), so its value is kept exactly as given
+    /// (`stricttables.html` §3). In an ordinary table `ANY` is NUMERIC by the usual rule.
+    pub fn column_affinity(&self, i: usize) -> Affinity {
+        let declared = self.columns[i].declared_type.as_deref();
+        if self.strict && declared.is_some_and(|d| d.trim().eq_ignore_ascii_case("ANY")) {
+            Affinity::Blob
+        } else {
+            affinity_of_declared_type(declared)
+        }
+    }
 }
 
 /// One resolved FOREIGN KEY constraint of a table (`lang_createtable.html` § foreign
