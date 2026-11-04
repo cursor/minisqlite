@@ -30,7 +30,7 @@
 //! emits the width-`N` row `[c0..c_{N-1}]`, and each row is located in — and removed from —
 //! the PRIMARY KEY index b-tree by its PRIMARY KEY (see [`DeleteCursor::apply_without_rowid`]).
 
-use minisqlite_btree::{index_delete, table_delete};
+use minisqlite_btree::{index_delete_with_order, table_delete};
 use minisqlite_catalog::{Catalog, TableDef};
 use minisqlite_pager::text_encoding_of;
 use minisqlite_plan::{Delete, Plan, TriggerDmlEvent};
@@ -443,7 +443,7 @@ impl DeleteCursor<'_> {
                     wr_index_keys_for_plans(&index_plans, logical, &mut ctx)?
                 };
                 delete_index_entries(&mut *pager, &index_plans, &sec_keys, enc)?;
-                index_delete(&mut *pager, root, &key)?;
+                index_delete_with_order(&mut *pager, root, &key, layout.order())?;
                 rt.record_change();
 
                 // Fire AFTER now the row is removed (post-write). The per-row `pager` was last

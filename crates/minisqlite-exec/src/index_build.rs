@@ -299,7 +299,7 @@ fn build_index_wr(
     loop {
         // READ PHASE (shared borrow, scoped): fetch the next (key bytes, decoded row).
         let fetched: Option<(Vec<u8>, Row)> = {
-            let mut cur = IndexCursor::open(&*pager, table_root)?;
+            let mut cur = IndexCursor::open_with_order(&*pager, table_root, layout.order().clone())?;
             let positioned = match &last_key {
                 None => cur.first()?,
                 // `seek_ge` re-finds the exact last key (the PK b-tree is unchanged across the

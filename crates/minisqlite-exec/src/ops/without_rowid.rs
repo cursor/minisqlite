@@ -17,21 +17,24 @@
 //!   PK-order field — see [`wr_pk_columns`]);
 //! * encode (schema → storage) / decode (storage → schema) so a scan reconstructs the
 //!   original column order without a fabricated rowid;
+//! * the PRIMARY KEY's per-column sort order and collation ([`WrLayout::order`]), the
+//!   [`KeyOrder`] every read and write of the PK b-tree must use;
 //! * the PRIMARY KEY uniqueness probe ([`WrLayout::pk_conflict_key`]);
 //! * the implicit `NOT NULL` on every PRIMARY KEY column ([`WrLayout::enforce_pk_not_null`]).
 
 use std::cmp::Ordering;
 
-use minisqlite_btree::IndexCursor;
+use minisqlite_btree::{IndexCursor, KeyField, KeyOrder};
 use minisqlite_catalog::TableDef;
 use minisqlite_fileformat::{
     decode_record_enc, decode_record_into_enc, encode_record_enc, TextEncoding,
 };
 use minisqlite_pager::{PageId, Pager};
 use minisqlite_plan::OnConflict;
-use minisqlite_types::{compare_values, Collation, ConstraintKind, Error, Result, Row, Value};
+use minisqlite_types::{compare_values, ConstraintKind, Error, Result, Row, Value};
 
 use crate::ops::constraints::ConstraintOutcome;
+use crate::ops::dml_index::collation_of;
 use crate::row::is_virtual_generated;
 
 /// The storage layout of a WITHOUT ROWID table's b-tree key record: a permutation from
@@ -52,6 +55,10 @@ use crate::row::is_virtual_generated;
 pub(crate) struct WrLayout {
     perm: Vec<usize>,
     pk_len: usize,
+    /// The b-tree key order: one [`KeyField`] per PRIMARY KEY column (its `DESC` flag and
+    /// effective collation), in PK order. The non-PK columns after them never decide an
+    /// order (the PK is unique), so they are left at the ascending BINARY default.
+    order: KeyOrder,
 }
 
 impl WrLayout {
@@ -60,6 +67,18 @@ impl WrLayout {
     /// and the columns a WR table implicitly makes `NOT NULL`.
     pub(crate) fn pk_columns(&self) -> &[usize] {
         &self.perm[..self.pk_len]
+    }
+
+    /// The PK b-tree's key order (each PRIMARY KEY column's sort order and collation,
+    /// sqlite3's `KeyInfo` for the PK index). Every cursor, insert, and delete on the WR
+    /// table's own b-tree must use it, so the tree stays in the order sqlite3 expects.
+    pub(crate) fn order(&self) -> &KeyOrder {
+        &self.order
+    }
+
+    /// The ordering of PRIMARY KEY column `i` (in PK order).
+    pub(crate) fn pk_field(&self, i: usize) -> KeyField {
+        self.order.field(i)
     }
 
     /// Reorder a schema-order logical row `[c0..c_{N-1}]` into the storage-order values
@@ -139,23 +158,13 @@ impl WrLayout {
     /// `pk_values`, returning that existing row's FULL key-record bytes (so a REPLACE can
     /// delete it) or `None` when there is no conflict.
     ///
-    /// The probe seeks the PK prefix and compares the landed entry's leading PK columns
-    /// value-wise under `Binary` collation — the same ordering the index b-tree itself is
-    /// built on (`compare_index_keys`), so "is this PK present?" here can never disagree
-    /// with where an insert would place the key. WR PK columns are implicitly `NOT NULL`
-    /// (enforced before this call), so there is no NULL-distinctness subtlety.
-    ///
-    /// SCOPED FOLLOW-UP (same collation bug class as FIX 1/2/3, deliberately NOT fixed
-    /// here): a `TEXT COLLATE NOCASE PRIMARY KEY` WITHOUT ROWID table should treat 'a' and
-    /// 'A' as the SAME key (a conflict), like the UNIQUE-index path in `ops/dml_index.rs`
-    /// which IS collation-aware — so this is a DRY divergence. It is NOT a one-line swap of
-    /// the `Collation::Binary` above: correctness requires the ENTIRE WR PK b-tree to be
-    /// KEYED under the PK columns' declared collations (the `encode_record` key bytes and
-    /// the `compare_index_keys` comparator this probe must agree with are BINARY today), so
-    /// swapping only this comparison would make the probe disagree with the tree's physical
-    /// order and could miss or mis-place conflicts. The correct fix threads per-PK-column
-    /// collation through WR key encoding + the index comparator + this probe together; it
-    /// is recorded as a follow-up rather than half-done here.
+    /// The probe seeks the PK prefix under the PK b-tree's [`order`](Self::order) and
+    /// compares the landed entry's leading PK columns value-wise under each column's
+    /// collation — the same ordering the b-tree itself is built on, so "is this PK
+    /// present?" here can never disagree with where an insert would place the key. A
+    /// `COLLATE NOCASE` PK column therefore treats `'a'` and `'A'` as the same key, as
+    /// sqlite3 does. WR PK columns are implicitly `NOT NULL` (enforced before this call), so
+    /// there is no NULL-distinctness subtlety.
     pub(crate) fn pk_conflict_key(
         &self,
         pager: &dyn Pager,
@@ -167,7 +176,7 @@ impl WrLayout {
         // compare in `seek_ge` lines up with the stored (same-encoding) WR key records.
         // `enc` is passed by the caller (read once per statement), not re-derived per row.
         let prefix = encode_record_enc(pk_values, enc);
-        let mut cur = IndexCursor::open(pager, root)?;
+        let mut cur = IndexCursor::open_with_order(pager, root, self.order.clone())?;
         // A prefix key sorts before every full record sharing that prefix, so `seek_ge`
         // lands on the first entry whose PK columns are >= the target PK.
         if !cur.seek_ge(&prefix)? {
@@ -181,11 +190,22 @@ impl WrLayout {
             return Ok(None);
         }
         for (i, want) in pk_values.iter().enumerate() {
-            if compare_values(&decoded[i], want, Collation::Binary) != Ordering::Equal {
+            if compare_values(&decoded[i], want, self.pk_field(i).collation) != Ordering::Equal {
                 return Ok(None); // The landed entry has a different PK — no conflict.
             }
         }
         Ok(Some(found.into_owned()))
+    }
+
+    /// Whether two PRIMARY KEY value tuples (in PK order) are the SAME key: equal column by
+    /// column under each PK column's collation, the order the b-tree is keyed on. So under a
+    /// `COLLATE NOCASE` PK, `'a'` and `'A'` are one key, and rewriting one to the other is not
+    /// a PRIMARY KEY change.
+    pub(crate) fn pk_equal(&self, a: &[Value], b: &[Value]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).enumerate().all(|(i, (x, y))| {
+                compare_values(x, y, self.pk_field(i).collation) == Ordering::Equal
+            })
     }
 
     /// Enforce the implicit `NOT NULL` on every PRIMARY KEY column of a WITHOUT ROWID
@@ -270,7 +290,27 @@ pub(crate) fn wr_layout(def: &TableDef) -> Result<WrLayout> {
         stored_cols,
         "WR storage permutation must cover every STORED column exactly once"
     );
-    Ok(WrLayout { perm, pk_len })
+    let order = KeyOrder::new(perm[..pk_len].iter().map(|&p| wr_pk_field(def, p)).collect());
+    Ok(WrLayout { perm, pk_len, order })
+}
+
+/// The sort order and effective collation of PRIMARY KEY column `p` (a schema index) of a
+/// WITHOUT ROWID table, as sqlite3 keys its PK b-tree: the PRIMARY KEY clause's `DESC` and
+/// explicit `COLLATE`, else the column's declared collation, else BINARY. Read from the
+/// PK's auto-index spec (`emit_row == false`), the same metadata `PRAGMA index_xinfo`
+/// reports. An INTEGER PRIMARY KEY has no such spec and is keyed ascending under its
+/// column collation.
+fn wr_pk_field(def: &TableDef, p: usize) -> KeyField {
+    let col = &def.columns[p];
+    let kc = def.auto_indexes.iter().find(|s| !s.emit_row).and_then(|spec| {
+        let pos = spec.columns.iter().position(|c| c.eq_ignore_ascii_case(&col.name))?;
+        spec.key_columns.get(pos)
+    });
+    let explicit = kc.and_then(|k| k.collation.as_deref());
+    KeyField {
+        collation: collation_of(explicit.or(col.collation.as_deref())),
+        descending: kc.is_some_and(|k| k.descending),
+    }
 }
 
 /// The PRIMARY KEY columns of a WITHOUT ROWID table, as schema-column indices in PK

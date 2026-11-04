@@ -12,14 +12,17 @@
 //!
 //! ## Correctness at the executor boundary (load-bearing)
 //! The index executor ([`minisqlite_exec`]'s `index_scan`) seeks the index b-tree
-//! which is ordered under [`Collation::Binary`] only, and it evaluates each seek /
-//! bound expression **raw** — it applies neither operand affinity nor a NULL guard.
-//! So a term is only turned into an index seek when that raw seek is provably right:
+//! which is ordered under each key column's own collation and sort order (see
+//! [`index_column_collation`]), and it evaluates each seek / bound expression **raw** —
+//! it applies neither operand affinity nor a NULL guard. So a term is only turned into an
+//! index seek when that raw seek is provably right:
 //!
-//! * the comparison's resolved collation is `Binary` (else the index order can't
-//!   serve it);
+//! * the comparison's resolved collation is the index column's collation (else the index
+//!   order can't serve it: `c = 'x'` under BINARY cannot seek a NOCASE-ordered index, and
+//!   `c = 'x'` on a NOCASE column cannot seek a BINARY one). A `DESC` column is fine: the
+//!   executor maps value bounds onto index order itself;
 //! * the comparison does not force an affinity onto the COLUMN side. The index keys
-//!   were written under the column's own storage affinity and ordered under Binary; a
+//!   were written under the column's own storage affinity and ordered under it; a
 //!   comparison that coerces the column to a *foreign* class (datatype3 §4.2 applies
 //!   NUMERIC to a TEXT/NONE column facing a numeric operand, or TEXT to a NONE column
 //!   facing a text one — e.g. `text_col = CAST(5 AS INTEGER)`) would need the index
@@ -53,7 +56,6 @@
 //! redundant filter — so every uncertain case falls back to the residual.
 //!
 //! [`Filter`]: crate::PlanNode::Filter
-//! [`Collation::Binary`]: minisqlite_types::Collation
 
 use minisqlite_catalog::{Catalog, IndexDef, KeyColumn, TableDef};
 use minisqlite_expr::{CmpOp, EvalExpr};
@@ -253,16 +255,24 @@ fn build_index_candidate(
     let mut eq_prefix: Vec<EvalExpr> = Vec::new();
     let mut remove: Vec<usize> = Vec::new();
 
+    // The collation each index column is ordered under; a term must compare under it to
+    // seek that column. An unknown collation name (not creatable, but a foreign file could
+    // carry one) stops the prefix there.
+    let key_collation = |p: usize| -> Option<Collation> {
+        index_column_collation(idx.key_columns.get(p)?, td, &idx.columns[p])
+    };
+
     // Longest contiguous equality prefix, index column 0, 1, 2, …
     let mut p = 0usize;
     while p < idx.columns.len() {
         let Some(reg) = col_reg(td, &idx.columns[p], n) else { break };
+        let Some(coll) = key_collation(p) else { break };
         let mut matched: Option<(usize, EvalExpr, bool)> = None;
         for (ci, c) in conjuncts.iter().enumerate() {
             if used[ci] {
                 continue;
             }
-            if let Some((value, consume)) = match_index_eq(c, reg) {
+            if let Some((value, consume)) = match_index_eq(c, reg, coll) {
                 matched = Some((ci, value, consume));
                 break;
             }
@@ -290,12 +300,12 @@ fn build_index_candidate(
     // cannot be made in-loop.
     let mut consumable_high: Option<usize> = None;
     if p < idx.columns.len() {
-        if let Some(reg) = col_reg(td, &idx.columns[p], n) {
+        if let (Some(reg), Some(coll)) = (col_reg(td, &idx.columns[p], n), key_collation(p)) {
             for (ci, c) in conjuncts.iter().enumerate() {
                 if used[ci] {
                     continue;
                 }
-                if let Some((side, bound, consume)) = match_index_range(c, reg) {
+                if let Some((side, bound, consume)) = match_index_range(c, reg, coll) {
                     match side {
                         Side::Lo if low.is_none() => {
                             low = Some(bound);
@@ -378,38 +388,52 @@ pub fn col_reg(td: &TableDef, name: &str, n: usize) -> Option<usize> {
     Some(if td.rowid_alias == Some(pos) { n } else { pos })
 }
 
-/// Whether an index key column's DECLARED collation resolves to [`Collation::Binary`]
-/// (`None` inherits, taken as Binary; an explicit `BINARY` also qualifies; NOCASE / RTRIM
-/// decline). The one source of truth for the "is this index key column usable for a
-/// BINARY-ordered walk" rule, shared by BOTH b-tree-order optimizers — the ORDER-BY scan
-/// rewrite ([`crate::compile::order_scan`]) and the MIN/MAX seek
-/// ([`crate::compile::minmax_index`]) — so the two cannot disagree about which indexes are
-/// eligible. Today the index b-tree is physically Binary-ordered regardless of this field
-/// (see `minisqlite_btree::index_key`); guarding on the DECLARED collation keeps both
-/// optimizations correct if per-column index collation is ever honored, and keeps that
-/// future relaxation a ONE-place change rather than two copies that must move in lockstep.
-pub(crate) fn key_column_is_binary(kc: &KeyColumn) -> bool {
-    match &kc.collation {
-        None => true,
-        Some(name) => matches!(parse_collation(name), Ok(Collation::Binary)),
+/// The collation index key column `name` (with key metadata `kc`) is ordered under in
+/// the b-tree: the index's explicit `COLLATE`, else the named table column's declared
+/// collation, else BINARY (lang_createindex.html; an expression key column names no table
+/// column, so it is BINARY unless it says otherwise). `None` for an unknown collation name.
+/// The executor builds the b-tree key order by the same rule
+/// (`minisqlite_exec`'s `index_key_fields`).
+pub(crate) fn index_column_collation(
+    kc: &KeyColumn,
+    td: &TableDef,
+    name: &str,
+) -> Option<Collation> {
+    let inherited = || {
+        let col = td.columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+        col.collation.as_deref()
+    };
+    match kc.collation.as_deref().or_else(inherited) {
+        None => Some(Collation::Binary),
+        Some(n) => parse_collation(n).ok(),
     }
+}
+
+/// Whether an index key column is ordered under [`Collation::Binary`] in the b-tree (see
+/// [`index_column_collation`]: an explicit `COLLATE`, else the column's declared one). The
+/// one source of truth for the "is this index key column usable for a BINARY-ordered walk"
+/// rule, shared by BOTH b-tree-order optimizers — the ORDER-BY scan rewrite
+/// ([`crate::compile::order_scan`]) and the MIN/MAX seek ([`crate::compile::minmax_index`])
+/// — so the two cannot disagree about which indexes are eligible.
+pub(crate) fn key_column_is_binary(kc: &KeyColumn, td: &TableDef, name: &str) -> bool {
+    index_column_collation(kc, td, name) == Some(Collation::Binary)
 }
 
 /// If `e` is a usable equality (`col = value` / `col IS value`) on the index column
 /// at register `col_reg`, return `(seek_value, consume)`: the value to place in the
 /// seek prefix and whether the term is fully consumed (removed from the residual).
 ///
-/// Usable requires a `Binary` collation (the index's key order) and no forced
-/// column-side affinity (either would make the Binary-ordered index keys the wrong
-/// thing to seek). A literal value gets its operand affinity applied here and is
+/// Usable requires the comparison collation to be `key_collation` (the index column's
+/// key order) and no forced column-side affinity (either would make the index keys the
+/// wrong thing to seek). A literal value gets its operand affinity applied here and is
 /// consumed exactly; a runtime value is used raw only when it needs no affinity, and
 /// is kept in the residual (so a NULL binding is still filtered — `col = NULL` is
 /// empty, not the index's NULL rows).
-fn match_index_eq(e: &EvalExpr, col_reg: usize) -> Option<(EvalExpr, bool)> {
+fn match_index_eq(e: &EvalExpr, col_reg: usize, key_collation: Collation) -> Option<(EvalExpr, bool)> {
     let EvalExpr::Compare { op: CmpOp::Eq, null_safe, left, right, meta } = e else {
         return None;
     };
-    if meta.collation != Collation::Binary {
+    if meta.collation != key_collation {
         return None;
     }
     let (value, value_aff, col_aff) = if is_column(left, col_reg) && !has_column_ref(right) {
@@ -421,7 +445,7 @@ fn match_index_eq(e: &EvalExpr, col_reg: usize) -> Option<(EvalExpr, bool)> {
     };
     // A comparison that forces an affinity onto the COLUMN side (datatype3 §4.2 rule 1
     // NUMERIC-onto-non-numeric, or rule 2 TEXT-onto-none) coerces it out of the storage
-    // class the Binary-ordered index stored it under, so a raw seek would miss rows.
+    // class the index stored it under, so a raw seek would miss rows.
     // Decline; the residual filter applies the affinity correctly.
     if col_aff.is_some() {
         return None;
@@ -454,11 +478,15 @@ fn match_index_eq(e: &EvalExpr, col_reg: usize) -> Option<(EvalExpr, bool)> {
 /// If `e` is a usable range comparison on the index column at register `col_reg`,
 /// return `(side, bound, consume)`. The operator is normalized so the value is
 /// compared against the column on the left. Same usability rules as [`match_index_eq`].
-fn match_index_range(e: &EvalExpr, col_reg: usize) -> Option<(Side, RangeBound, bool)> {
+fn match_index_range(
+    e: &EvalExpr,
+    col_reg: usize,
+    key_collation: Collation,
+) -> Option<(Side, RangeBound, bool)> {
     let EvalExpr::Compare { op, null_safe: false, left, right, meta } = e else {
         return None;
     };
-    if meta.collation != Collation::Binary {
+    if meta.collation != key_collation {
         return None;
     }
     let (value, value_aff, col_aff, effective) = if is_column(left, col_reg) && !has_column_ref(right) {
@@ -468,7 +496,7 @@ fn match_index_range(e: &EvalExpr, col_reg: usize) -> Option<(Side, RangeBound, 
     } else {
         return None;
     };
-    // See `match_index_eq`: a forced column-side affinity means the Binary-ordered index
+    // See `match_index_eq`: a forced column-side affinity means the index
     // keys are the wrong storage class to seek, so decline the index for this term.
     if col_aff.is_some() {
         return None;
@@ -1360,18 +1388,44 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Hard constraints: NOCASE collation and partial indexes are not usable.
+    // Hard constraints: a collation other than the index column's, and partial
+    // indexes, are not usable.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn a_nocase_column_comparison_does_not_use_the_index() {
-        // The index b-tree is Binary-ordered; a NOCASE comparison cannot seek it.
+    fn a_nocase_column_comparison_seeks_an_index_that_inherits_nocase() {
+        // The index on a NOCASE column is ordered under NOCASE (it inherits the column's
+        // collation), so the column's own NOCASE comparison can seek it.
         let tables =
             vec![tdef("t", vec![col("a", Some("INTEGER"), None), col("c", Some("TEXT"), Some("NOCASE"))], None)];
         let cat = IdxCatalog { tables, indexes: vec![idef("ic", "t", &["c"], false, false)] };
         let plan = plan_it("SELECT * FROM t WHERE c = 'x'", &cat);
+        let (name, eq, _l, _h) = index_seek(&plan.root);
+        assert_eq!(name, "ic");
+        assert_eq!(eq.len(), 1);
+    }
+
+    #[test]
+    fn a_comparison_under_another_collation_than_the_index_column_does_not_seek_it() {
+        // A BINARY index on a NOCASE column cannot serve the column's NOCASE comparison.
+        let tables =
+            vec![tdef("t", vec![col("a", Some("INTEGER"), None), col("c", Some("TEXT"), Some("NOCASE"))], None)];
+        let mut ic = idef("ic", "t", &["c"], false, false);
+        ic.key_columns[0].collation = Some("BINARY".into());
+        let cat = IdxCatalog { tables, indexes: vec![ic] };
+        let plan = plan_it("SELECT * FROM t WHERE c = 'x'", &cat);
         assert!(matches!(access_leaf(&plan.root), PlanNode::SeqScan(_)), "NOCASE term → SeqScan");
         assert!(filter_predicate(&plan.root).is_some(), "the NOCASE term is the residual");
+
+        // A NOCASE index on a BINARY column cannot serve the column's BINARY comparison.
+        let tables = vec![tdef("t", vec![col("a", Some("INTEGER"), None), col("b", Some("TEXT"), None)], None)];
+        let mut ib = idef("ib", "t", &["b"], false, false);
+        ib.key_columns[0].collation = Some("NOCASE".into());
+        let cat = IdxCatalog { tables, indexes: vec![ib] };
+        for sql in ["SELECT * FROM t WHERE b = 'x'", "SELECT * FROM t WHERE b > 'x'"] {
+            let plan = plan_it(sql, &cat);
+            assert!(matches!(access_leaf(&plan.root), PlanNode::SeqScan(_)), "{sql}: BINARY term → SeqScan");
+        }
     }
 
     #[test]
