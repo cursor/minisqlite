@@ -40,7 +40,7 @@ use std::collections::BinaryHeap;
 use minisqlite_catalog::{Catalog, TableDef};
 use minisqlite_expr::EvalExpr;
 use minisqlite_functions::FunctionRegistry;
-use minisqlite_types::{affinity_of_declared_type, DbIndex, Error, Result};
+use minisqlite_types::{DbIndex, Error, Result};
 
 use crate::bind::{bind_expr, Scope, Source};
 use crate::plan::{CtePlan, GeneratedProgram, Plan, PlanNode, TableGenerated, TriggerProgram};
@@ -82,7 +82,7 @@ pub fn bind_generated_programs(
     for (i, col) in def.columns.iter().enumerate() {
         if let Some(g) = &col.generated {
             let expr = bind_expr(&scope, ctx, &g.expr)?;
-            let affinity = affinity_of_declared_type(col.declared_type.as_deref());
+            let affinity = def.column_affinity(i);
             out.push(GeneratedProgram { col_index: i, expr, stored: g.stored, affinity });
         }
     }

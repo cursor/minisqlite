@@ -79,8 +79,8 @@ use minisqlite_plan::{
     PlanNode,
 };
 use minisqlite_types::{
-    affinity_of_declared_type, apply_affinity, compare_for_eq, Affinity, Collation, ConstraintKind,
-    DbIndex, Error, Result, Row, Value,
+    apply_affinity, compare_for_eq, Affinity, Collation, ConstraintKind, DbIndex, Error,
+    Result, Row, Value,
 };
 
 use crate::context::EvalCtx;
@@ -451,7 +451,7 @@ fn parent_key_exists(
     // runs when it is on. A parent PK / UNIQUE index could make this a seek — a follow-up.
     let affinities: Vec<Affinity> = key_idxs
         .iter()
-        .map(|&i| affinity_of_declared_type(parent.columns[i].declared_type.as_deref()))
+        .map(|&i| parent.column_affinity(i))
         .collect();
     let collations: Vec<Collation> =
         key_idxs.iter().map(|&i| collation_of(parent.columns[i].collation.as_deref())).collect();
@@ -594,7 +594,7 @@ fn decode_scanned_row(
 fn parent_key_meta(parent: &TableDef, key_idxs: &[usize]) -> (Vec<Affinity>, Vec<Collation>) {
     let affinities = key_idxs
         .iter()
-        .map(|&i| affinity_of_declared_type(parent.columns[i].declared_type.as_deref()))
+        .map(|&i| parent.column_affinity(i))
         .collect();
     let collations =
         key_idxs.iter().map(|&i| collation_of(parent.columns[i].collation.as_deref())).collect();
@@ -763,12 +763,7 @@ pub(crate) fn enforce_parent_delete(
                             .into_iter()
                             .enumerate()
                             .map(|(k, v)| {
-                                apply_affinity(
-                                    v,
-                                    affinity_of_declared_type(
-                                        child.columns[cidx[k]].declared_type.as_deref(),
-                                    ),
-                                )
+                                apply_affinity(v, child.column_affinity(cidx[k]))
                             })
                             .collect()
                     } else {
@@ -959,12 +954,7 @@ pub(crate) fn enforce_parent_update(
                             } else {
                                 Value::Null
                             };
-                            apply_affinity(
-                                raw,
-                                affinity_of_declared_type(
-                                    child.columns[cidx[k]].declared_type.as_deref(),
-                                ),
-                            )
+                            apply_affinity(raw, child.column_affinity(cidx[k]))
                         })
                         .collect();
                     // SET DEFAULT still must satisfy the FK (foreignkeys.html §4.3). After this

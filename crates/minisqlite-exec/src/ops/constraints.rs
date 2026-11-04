@@ -26,6 +26,10 @@
 //! constraint error) on the first violation. The caller acts on the result. `DELETE` is
 //! deliberately not a caller of either: removing a row cannot violate a column `NOT NULL`
 //! or a `CHECK`.
+//!
+//! The STRICT datatype rule (`stricttables.html` §2) lives here for the same reason:
+//! [`enforce_strict_types`] is pure like [`enforce_not_null`], runs right after it on the
+//! affinity-applied row, and is shared by every INSERT / UPDATE / UPSERT write path.
 
 use minisqlite_catalog::TableDef;
 use minisqlite_expr::{eval, truth};
@@ -119,6 +123,61 @@ pub(crate) fn enforce_not_null(
 /// style in `insert.rs` / `update.rs`.
 fn not_null_error(def: &TableDef, j: usize) -> Error {
     Error::constraint(ConstraintKind::NotNull, format!("{}.{}", def.name, def.columns[j].name))
+}
+
+/// Enforce the STRICT datatype rule (`stricttables.html` §2) over the logical row
+/// `[c0..c_{N-1}, ..]`, whose values have already had the column affinity applied. A
+/// no-op unless [`TableDef::strict`]. For each column, a non-NULL value must be of the
+/// declared type: INT / INTEGER an integer, REAL a real (REAL affinity has already turned
+/// an integer into one), TEXT a text, BLOB a blob; ANY accepts anything. NULL is left to
+/// [`enforce_not_null`], which the caller runs first, as sqlite does.
+///
+/// Two kinds of column are skipped, both matching sqlite 3.51.3: the rowid alias (its slot
+/// holds the rowid, already forced to an integer or rejected with "datatype mismatch"),
+/// and a GENERATED column (sqlite does not type-check a generated value).
+///
+/// A violation is an error under every `ON CONFLICT` policy (sqlite does not let `OR
+/// IGNORE` skip it), so this returns no [`ConstraintOutcome`]. The message is sqlite's:
+/// `cannot store TEXT value in INTEGER column t.c`. It has no "constraint failed" phrase,
+/// so it is built directly rather than through [`Error::constraint`]; it is still an
+/// `Error::Constraint` (SQLITE_CONSTRAINT, extended code SQLITE_CONSTRAINT_DATATYPE).
+pub(crate) fn enforce_strict_types(def: &TableDef, logical: &[Value]) -> Result<()> {
+    if !def.strict {
+        return Ok(());
+    }
+    for (j, col) in def.columns.iter().enumerate() {
+        if def.rowid_alias == Some(j) || col.generated.is_some() {
+            continue;
+        }
+        // The builder has already rejected a STRICT column whose type is missing or not
+        // one of the six names, so the trimmed declared type is one of them here.
+        let declared = col.declared_type.as_deref().unwrap_or("").trim();
+        let ok = match &logical[j] {
+            Value::Null => true,
+            Value::Integer(_) => {
+                declared.eq_ignore_ascii_case("INT") || declared.eq_ignore_ascii_case("INTEGER")
+            }
+            Value::Real(_) => declared.eq_ignore_ascii_case("REAL"),
+            Value::Text(_) => declared.eq_ignore_ascii_case("TEXT"),
+            Value::Blob(_) => declared.eq_ignore_ascii_case("BLOB"),
+        } || declared.eq_ignore_ascii_case("ANY");
+        if !ok {
+            let value_type = match &logical[j] {
+                Value::Null => "NULL",
+                Value::Integer(_) => "INT",
+                Value::Real(_) => "REAL",
+                Value::Text(_) => "TEXT",
+                Value::Blob(_) => "BLOB",
+            };
+            return Err(Error::Constraint(format!(
+                "cannot store {value_type} value in {} column {}.{}",
+                declared.to_ascii_uppercase(),
+                def.name,
+                col.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Enforce every table/column `CHECK` constraint over the new row the caller passes as
@@ -290,6 +349,7 @@ mod tests {
             // Not an AUTOINCREMENT table: these constraint-helper tests never seed rowids.
             autoincrement: false,
             primary_key: Vec::new(),
+            strict: false,
         }
     }
 

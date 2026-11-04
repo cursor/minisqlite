@@ -206,6 +206,7 @@ pub(crate) fn table_def_from_ast(stmt: &CreateTable, root_page: PageId) -> Resul
         foreign_keys,
         autoincrement,
         primary_key,
+        strict: options.strict,
     })
 }
 
@@ -1069,8 +1070,9 @@ fn validate_foreign_key_child_columns(
 /// must declare a datatype (`missing datatype for <t>.<c>`), and that datatype must be
 /// exactly one of the six [`STRICT_DATATYPES`], compared ASCII case-insensitively against
 /// the WHOLE declared type text (`unknown datatype for <t>.<c>: "<TYPE>"`). This is the
-/// create-time half only; runtime STRICT type enforcement on INSERT (an
-/// `SQLITE_CONSTRAINT_DATATYPE`) is a separate slice. A non-STRICT table is unrestricted —
+/// create-time half only; the flag is recorded as [`TableDef::strict`] and the runtime half
+/// (rejecting a value of the wrong type on INSERT/UPDATE) is the executor's
+/// `enforce_strict_types`. A non-STRICT table is unrestricted —
 /// any type, or none, is legal — so this is a no-op unless `strict`.
 fn validate_strict_datatypes(
     table_name: &str,
@@ -1495,6 +1497,7 @@ fn render_literal(lit: &Literal) -> String {
 mod tests {
     use super::*;
     use minisqlite_sql::{parse, BinaryOp, Statement};
+    use minisqlite_types::Affinity;
 
     /// Parse a single `CREATE TABLE` and build its def with a fixed root page.
     fn tdef(sql: &str) -> TableDef {
@@ -1844,6 +1847,20 @@ mod tests {
         let t = tdef("CREATE TABLE t(x INTEGER PRIMARY KEY) WITHOUT ROWID");
         assert!(t.without_rowid);
         assert_eq!(t.rowid_alias, None);
+    }
+
+    #[test]
+    fn strict_records_the_flag_and_any_has_no_affinity() {
+        // The flag reaches the def (with and without WITHOUT ROWID), and an `ANY` column
+        // of a STRICT table has no affinity while an ordinary table's `ANY` is NUMERIC.
+        let t = tdef("CREATE TABLE t(a ANY, b INT) STRICT");
+        assert!(t.strict);
+        assert_eq!(t.column_affinity(0), Affinity::Blob);
+        assert_eq!(t.column_affinity(1), Affinity::Integer);
+        assert!(tdef("CREATE TABLE w(k INT PRIMARY KEY) STRICT, WITHOUT ROWID").strict);
+        let n = tdef("CREATE TABLE n(a ANY)");
+        assert!(!n.strict);
+        assert_eq!(n.column_affinity(0), Affinity::Numeric);
     }
 
     // --- AUTOINCREMENT restrictions (autoinc.html §3) --------------------------
