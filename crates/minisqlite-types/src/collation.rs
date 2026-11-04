@@ -29,10 +29,17 @@ pub enum Collation {
 ///   text value containing an embedded `\0`.
 /// * `Rtrim` strips trailing 0x20 bytes from both operands, then compares binary.
 pub fn compare_text(a: &str, b: &str, c: Collation) -> Ordering {
+    compare_text_bytes(a.as_bytes(), b.as_bytes(), c)
+}
+
+/// [`compare_text`] over raw text bytes, for callers that hold an encoded TEXT body and
+/// must not allocate (the index-key comparator compares record bodies borrowed). The
+/// rules are identical: each collating sequence only ever looks at bytes.
+pub fn compare_text_bytes(a: &[u8], b: &[u8], c: Collation) -> Ordering {
     match c {
-        Collation::Binary => a.as_bytes().cmp(b.as_bytes()),
-        Collation::NoCase => nocase_cmp(a.as_bytes(), b.as_bytes()),
-        Collation::Rtrim => rstrip_spaces(a.as_bytes()).cmp(rstrip_spaces(b.as_bytes())),
+        Collation::Binary => a.cmp(b),
+        Collation::NoCase => nocase_cmp(a, b),
+        Collation::Rtrim => rstrip_spaces(a).cmp(rstrip_spaces(b)),
     }
 }
 

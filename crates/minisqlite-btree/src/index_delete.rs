@@ -87,7 +87,7 @@ use minisqlite_types::{Error, Result};
 use crate::index::{balance_deeper_interior, propagate_split};
 use crate::index_balance::{plan_index_interior_groups, plan_index_leaf_groups};
 use crate::index_build::{build_index_interior, build_index_leaf, split_index_interior, IndexCell};
-use crate::index_key::{cell_key_bytes, compare_index_keys};
+use crate::index_key::{cell_key_bytes, compare_index_keys, KeyOrder};
 use crate::index_nav::{index_choose_child, index_leaf_search, index_pointer_at};
 use crate::overflow_io::free_overflow_chain;
 use crate::tree::{put_page, usable_of};
@@ -96,7 +96,21 @@ use crate::tree::{put_page, usable_of};
 /// Returns `Ok(true)` if the key was present and removed, `Ok(false)` if it was
 /// absent (the tree is left unchanged). Runs within whatever transaction the caller
 /// has open (it does not begin/commit). O(tree height).
+///
+/// The tree is taken as all-ascending BINARY: shorthand for
+/// [`index_delete_with_order`] with [`KeyOrder::default`].
 pub fn index_delete(pager: &mut dyn Pager, root: PageId, key: &[u8]) -> Result<bool> {
+    index_delete_with_order(pager, root, key, &KeyOrder::default())
+}
+
+/// [`index_delete`] on a tree ordered by `order` (its per-column sort order and
+/// collation), which must be the order the tree was written in.
+pub fn index_delete_with_order(
+    pager: &mut dyn Pager,
+    root: PageId,
+    key: &[u8],
+    order: &KeyOrder,
+) -> Result<bool> {
     let page_size = pager.page_size() as usize;
     let usable = usable_of(pager);
 
@@ -104,14 +118,14 @@ pub fn index_delete(pager: &mut dyn Pager, root: PageId, key: &[u8]) -> Result<b
     // can reach each parent. For a leaf hit `path` runs root..parent(leaf); for an
     // interior-divider hit it runs root..parent(pid) (the divider page is not pushed).
     let mut path: Vec<(PageId, u32)> = Vec::new();
-    match locate(pager, root, key, usable, &mut path)? {
+    match locate(pager, root, key, usable, order, &mut path)? {
         None => Ok(false),
         Some(Target::Leaf { leaf, idx }) => {
             delete_leaf_cell(pager, root, path, leaf, idx, page_size, usable)?;
             Ok(true)
         }
         Some(Target::Interior { pid, ptr }) => {
-            delete_interior_divider(pager, root, path, pid, ptr as usize, page_size, usable)?;
+            delete_interior_divider(pager, root, path, pid, ptr as usize, page_size, usable, order)?;
             Ok(true)
         }
     }
@@ -134,6 +148,7 @@ fn locate(
     root: PageId,
     key: &[u8],
     usable: usize,
+    order: &KeyOrder,
     path: &mut Vec<(PageId, u32)>,
 ) -> Result<Option<Target>> {
     let mut current = root;
@@ -143,17 +158,17 @@ fn locate(
             return Err(Error::format("index_delete reached a non-index b-tree page"));
         }
         if view.page_type().is_leaf() {
-            return match index_leaf_search(pager, &view, key, usable)? {
+            return match index_leaf_search(pager, &view, key, usable, order)? {
                 Ok(idx) => Ok(Some(Target::Leaf { leaf: current, idx })),
                 Err(_) => Ok(None),
             };
         }
-        let (child, ptr) = index_choose_child(pager, &view, key, usable)?;
+        let (child, ptr) = index_choose_child(pager, &view, key, usable, order)?;
         if (ptr as usize) < view.cell_count() as usize {
             let cell = view.index_interior_cell(ptr as usize)?;
             let dkey =
                 cell_key_bytes(pager, cell.local_payload, cell.payload_len, cell.overflow_page, usable)?;
-            if compare_index_keys(key, dkey.as_ref()) == Ordering::Equal {
+            if compare_index_keys(key, dkey.as_ref(), order) == Ordering::Equal {
                 return Ok(Some(Target::Interior { pid: current, ptr }));
             }
         }
@@ -217,6 +232,7 @@ fn delete_leaf_cell(
 /// root..parent(pid)) via the predecessor swap. See the module docs for the full
 /// argument; briefly: install the predecessor `P` over `K`'s slot (splitting `pid` and
 /// propagating up if it overflows), then remove `P` from its leaf.
+#[allow(clippy::too_many_arguments)]
 fn delete_interior_divider(
     pager: &mut dyn Pager,
     root: PageId,
@@ -225,6 +241,7 @@ fn delete_interior_divider(
     ptr: usize,
     page_size: usize,
     usable: usize,
+    order: &KeyOrder,
 ) -> Result<()> {
     // Descend the RIGHT spine of the divider's left subtree (child pointer `ptr`) to
     // the predecessor leaf, recording each interior at its right-most pointer index.
@@ -265,7 +282,7 @@ fn delete_interior_divider(
         let c = view.index_interior_cell(ptr)?;
         let k_key = cell_key_bytes(pager, c.local_payload, c.payload_len, c.overflow_page, usable)?;
         assert_eq!(
-            compare_index_keys(&p_key, k_key.as_ref()),
+            compare_index_keys(&p_key, k_key.as_ref(), order),
             Ordering::Less,
             "index_delete: predecessor must be strictly less than the divider it replaces",
         );
@@ -292,7 +309,7 @@ fn delete_interior_divider(
     // `pred_leaf` underflowed. Its rebalance needs a root→pred_leaf path; if the swap
     // split `pid`, re-descend for a fresh one, else the recorded spine is still valid.
     let path = if split {
-        fresh_path_to_pred_leaf(pager, root, &p_key, pred_leaf, usable)?
+        fresh_path_to_pred_leaf(pager, root, &p_key, pred_leaf, usable, order)?
     } else {
         let mut p = path_above;
         p.push((pid, ptr as u32));
@@ -398,9 +415,10 @@ fn fresh_path_to_pred_leaf(
     p_key: &[u8],
     pred_leaf: PageId,
     usable: usize,
+    order: &KeyOrder,
 ) -> Result<Vec<(PageId, u32)>> {
     let mut path: Vec<(PageId, u32)> = Vec::new();
-    let (pid, ptr) = match locate(pager, root, p_key, usable, &mut path)? {
+    let (pid, ptr) = match locate(pager, root, p_key, usable, order, &mut path)? {
         Some(Target::Interior { pid, ptr }) => (pid, ptr),
         _ => {
             return Err(Error::format(

@@ -162,7 +162,7 @@ fn index_leftmost_serves(ix: &IndexDef, table: &TableDef, n: usize, want_col: us
     if matches!(ix.key_exprs.first(), Some(Some(_))) {
         return false;
     }
-    if kc.descending || !key_column_is_binary(kc) {
+    if kc.descending || !key_column_is_binary(kc, table, name) {
         return false;
     }
     matches!(col_reg(table, name, n), Some(r) if r == want_col)

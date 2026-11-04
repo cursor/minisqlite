@@ -24,13 +24,22 @@
 //! matches, not the index size.
 //!
 //! ## Ordering / collation invariant (load-bearing)
-//! The index b-tree orders keys under `Collation::Binary` (see
-//! `minisqlite_btree::index_key::compare_index_keys`). Every prefix/bound comparison
-//! here therefore also uses `Collation::Binary`: the "stop once the prefix stops
-//! matching" and "stop once the bound is crossed" decisions are only sound if this
-//! comparator agrees with the order the cursor seeks in. Per-column collating
-//! sequences declared on an index are a cross-crate follow-up (the `IndexDef` carries
-//! no per-column collation today).
+//! The index b-tree orders keys under the index's [`KeyOrder`]: each key column's
+//! collation and `DESC` flag (see `minisqlite_btree::index_key`). The cursor seeks with
+//! that order, and every prefix/bound comparison here goes through the same
+//! [`KeyOrder::compare_column`]: the "stop once the prefix stops matching" and "stop once
+//! the bound is crossed" decisions are only sound if this comparator agrees with the order
+//! the cursor seeks in. The planner only seeks a column whose comparison collation is the
+//! index column's own collation, so comparing under the index collation is the query's
+//! comparison too.
+//!
+//! Everything below therefore works in INDEX order, not value order. On a `DESC` column
+//! the two differ: a value lower bound (`b > 5`) is where the scan ENDS in index order.
+//! [`IndexScanCursor::prepare`] swaps the bounds of a `DESC` range column once, so `low` /
+//! `high` always mean the index-order start / end, and the positioning and classification
+//! code is the same for both sort orders. NULLs sort last in a `DESC` column, so a value
+//! lower bound (now the index-order end) still stops the scan before them, and the
+//! planner's NULL rule (keep an upper-only bound in the residual) holds unchanged.
 //!
 //! ## Reverse positioning (the group-top problem)
 //! Forward is straightforward: `seek_ge` on the low side lands at the first matching
@@ -45,17 +54,17 @@
 
 use std::cmp::Ordering;
 
-use minisqlite_btree::{IndexCursor, TableCursor};
+use minisqlite_btree::{IndexCursor, KeyOrder, TableCursor};
 use minisqlite_catalog::TableDef;
 use minisqlite_expr::eval;
 use minisqlite_fileformat::{decode_record_enc, encode_record_enc, TextEncoding};
 use minisqlite_pager::text_encoding_of;
 use minisqlite_plan::{col_reg, GeneratedProgram, IndexOp, IndexScan, ScanDirection};
-use minisqlite_types::{compare_values, Collation, Error, Result, Row, Value};
+use minisqlite_types::{compare_values, Error, Result, Row, Value};
 
 use crate::context::EvalCtx;
 use crate::env::Env;
-use crate::ops::dml_index::{build_index_plan, wr_entry_pk, IndexPlan};
+use crate::ops::dml_index::{build_index_plan, index_key_fields, wr_entry_pk, IndexPlan};
 use crate::ops::generated::compute_generated;
 use crate::ops::with_outer;
 use crate::ops::without_rowid::{wr_layout, WrLayout};
@@ -111,7 +120,6 @@ pub(crate) fn index_scan<'a>(
     }
 
     let pager = env.pagers.get(node.db)?;
-    let index_cursor = IndexCursor::open(pager, idx.root_page)?;
     // Opened for the rowid by-rowid fetch. For a WR table `table.root_page` is an index
     // b-tree (the PK store), not a table b-tree, so this cursor is UNUSED on the WR path
     // (which fetches through `wr.pk_cursor` below); `TableCursor::open` does no I/O, so
@@ -135,15 +143,23 @@ pub(crate) fn index_scan<'a>(
     // (a partial index physically contains only its matching rows). The planner also declines
     // a partial index for reads, so `idx` here is a full index regardless.
     let wr = if table.without_rowid {
-        Some(WrRead {
-            plan: build_index_plan(table, idx, &[], None)?,
-            layout: wr_layout(table)?,
-            pk_cursor: IndexCursor::open(pager, table.root_page)?,
-            scratch: Vec::new(),
-        })
+        let layout = wr_layout(table)?;
+        let pk_cursor =
+            IndexCursor::open_with_order(pager, table.root_page, layout.order().clone())?;
+        let plan = build_index_plan(table, idx, &[], None)?;
+        Some(WrRead { plan, layout, pk_cursor, scratch: Vec::new() })
     } else {
         None
     };
+    // The index's key order (per-column collation and `DESC`): the WR plan's full order
+    // (indexed columns + trailing PK), else the indexed columns followed by the ascending
+    // BINARY rowid. Built from the catalog definition, so an expression index needs no
+    // compiled key expressions here.
+    let order = match &wr {
+        Some(w) => w.plan.order.clone(),
+        None => KeyOrder::new(index_key_fields(table, idx)),
+    };
+    let index_cursor = IndexCursor::open_with_order(pager, idx.root_page, order.clone())?;
 
     // Covering (index-only) read: engage ONLY when the planner marked this scan covering
     // AND the table has no generated column AND it is a rowid table. The planner already
@@ -173,6 +189,7 @@ pub(crate) fn index_scan<'a>(
         op: &node.op,
         direction: &node.direction,
         key_columns: idx.columns.len(),
+        order,
         outer,
         phase: Phase::Init,
         eq_vals: Vec::new(),
@@ -273,13 +290,18 @@ struct IndexScanCursor<'a> {
     /// The number of indexed columns `k` (an index key record is `[c0..c_{k-1},
     /// rowid]`), so a range bound applies only when `eq_prefix.len() < k`.
     key_columns: usize,
+    /// The index's key order — the one the cursor seeks with. Every prefix / bound test
+    /// compares through it (see the module doc's ordering invariant).
+    order: KeyOrder,
     outer: &'a [Value],
     phase: Phase,
     /// The evaluated equality-prefix values (`eq_prefix`), computed once on `Init`.
     eq_vals: Vec<Value>,
-    /// The evaluated lower bound `(value, inclusive)` on the column after the prefix.
+    /// The evaluated lower bound `(value, inclusive)` on the column after the prefix, in
+    /// INDEX order (for a `DESC` column this is the query's upper bound, see `prepare`).
     low: Option<(Value, bool)>,
-    /// The evaluated upper bound `(value, inclusive)` on the column after the prefix.
+    /// The evaluated upper bound `(value, inclusive)` on the column after the prefix, in
+    /// INDEX order (for a `DESC` column this is the query's lower bound).
     high: Option<(Value, bool)>,
     /// The base table's generated-column programs (STORED + VIRTUAL, column order); empty
     /// for a non-generated table. The read path computes only the VIRTUAL subset after the
@@ -348,6 +370,10 @@ impl IndexScanCursor<'_> {
     /// evaluation needs the runtime and cannot happen at build time. A `FullScan`
     /// leaves the defaults (empty prefix, no bounds), which the rest of the code treats
     /// exactly like a `Seek` with no constraints.
+    ///
+    /// The plan's bounds are in VALUE order. On a `DESC` range column they are swapped
+    /// here into INDEX order (the value upper bound is where the walk starts), so the rest
+    /// of the cursor never looks at the sort order again.
     fn prepare(&mut self, rt: &mut Runtime) -> Result<()> {
         let op = self.op;
         if let IndexOp::Seek { eq_prefix, low, high } = op {
@@ -364,9 +390,15 @@ impl IndexScanCursor<'_> {
                 Some(b) => Some((eval(&b.value, self.outer, &mut ctx)?, b.inclusive)),
                 None => None,
             };
+            let p = eq.len();
             self.eq_vals = eq;
-            self.low = low;
-            self.high = high;
+            if p < self.key_columns && self.order.field(p).descending {
+                self.low = high;
+                self.high = low;
+            } else {
+                self.low = low;
+                self.high = high;
+            }
         }
         Ok(())
     }
@@ -506,9 +538,7 @@ impl IndexScanCursor<'_> {
         for i in 0..p {
             match entry.get(i) {
                 // This prefix column still matches: keep checking the rest of the prefix.
-                Some(v)
-                    if compare_values(v, &self.eq_vals[i], Collation::Binary)
-                        == Ordering::Equal => {}
+                Some(v) if self.order.compare_column(i, v, &self.eq_vals[i]) == Ordering::Equal => {}
                 // The prefix DIVERGED at this column. The index is ordered and we are
                 // walking away from the near end of the prefix group, so no later entry
                 // in this direction can match — the ordered scan is finished.
@@ -526,7 +556,7 @@ impl IndexScanCursor<'_> {
         if p < self.key_columns {
             if let Some(col) = entry.get(p) {
                 if let Some((hv, incl)) = &self.high {
-                    let c = compare_values(col, hv, Collation::Binary);
+                    let c = self.order.compare_column(p, col, hv);
                     if c == Ordering::Greater || (c == Ordering::Equal && !incl) {
                         return match self.direction {
                             ScanDirection::Forward => Class::Stop,
@@ -535,7 +565,7 @@ impl IndexScanCursor<'_> {
                     }
                 }
                 if let Some((lv, incl)) = &self.low {
-                    let c = compare_values(col, lv, Collation::Binary);
+                    let c = self.order.compare_column(p, col, lv);
                     if c == Ordering::Less || (c == Ordering::Equal && !incl) {
                         return match self.direction {
                             ScanDirection::Forward => Class::Skip,
@@ -548,23 +578,22 @@ impl IndexScanCursor<'_> {
         Class::Emit
     }
 
-    /// Whether the entry's leading columns equal `eq_vals` (under Binary collation).
+    /// Whether the entry's leading columns equal `eq_vals` (under the index collations).
     fn prefix_matches(&self, entry: &[Value]) -> bool {
         let p = self.eq_vals.len();
         if entry.len() < p {
             return false;
         }
-        (0..p).all(|i| {
-            compare_values(&entry[i], &self.eq_vals[i], Collation::Binary) == Ordering::Equal
-        })
+        (0..p).all(|i| self.order.compare_column(i, &entry[i], &self.eq_vals[i]) == Ordering::Equal)
     }
 
-    /// Compare the entry's column right after the equality prefix against `v`. A short
+    /// Compare the entry's column right after the equality prefix against `v`, in index
+    /// order. A short
     /// entry missing that column sorts `Less` (never `Equal`), so it is not treated as
     /// in a value group.
     fn col_after_prefix_cmp(&self, entry: &[Value], v: &Value) -> Ordering {
         match entry.get(self.eq_vals.len()) {
-            Some(col) => compare_values(col, v, Collation::Binary),
+            Some(col) => self.order.compare_column(self.eq_vals.len(), col, v),
             None => Ordering::Less,
         }
     }
@@ -680,14 +709,13 @@ impl IndexScanCursor<'_> {
         let key_bytes = wr.pk_cursor.key()?.into_owned();
         let mut local = wr.layout.decode_row_enc(&key_bytes, table, &mut wr.scratch, enc);
         // Verify the landed row's PRIMARY KEY is EXACTLY the one the entry named (seek_ge can
-        // land on a greater key when the target row is absent). Compare under Binary — the WR
-        // PK b-tree's own ordering (see `WrLayout::pk_conflict_key`).
+        // land on a greater key when the target row is absent). Compare under each PK column's
+        // collation — the WR PK b-tree's own ordering (see `WrLayout::pk_conflict_key`).
         let found_pk = wr.layout.pk_values(&local);
         if found_pk.len() != pk.len()
-            || found_pk
-                .iter()
-                .zip(&pk)
-                .any(|(a, b)| compare_values(a, b, Collation::Binary) != Ordering::Equal)
+            || found_pk.iter().zip(&pk).enumerate().any(|(i, (a, b))| {
+                compare_values(a, b, wr.layout.pk_field(i).collation) != Ordering::Equal
+            })
         {
             return Err(missing());
         }
