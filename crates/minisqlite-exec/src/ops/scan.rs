@@ -62,7 +62,7 @@ pub(crate) fn seq_scan<'a>(
     let def: &'a TableDef = resolve_base_table(env.catalog, node.db, &node.table)?;
     if def.without_rowid {
         let layout = wr_layout(def)?;
-        let cursor = IndexCursor::open(pager, def.root_page)?;
+        let cursor = IndexCursor::open_with_order(pager, def.root_page, layout.order().clone())?;
         return Ok(Box::new(WrSeqScanCursor {
             env,
             def,

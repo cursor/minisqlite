@@ -33,7 +33,7 @@ pub use numeric::{
     NumericPrefix,
 };
 
-pub use collation::{compare_text, Collation};
+pub use collation::{compare_text, compare_text_bytes, Collation};
 
 pub use compare::{compare_for_eq, compare_values, extremum_wins, storage_class_rank};
 

@@ -24,8 +24,8 @@
 //! Case 9 (no regression to the rowid index path) is covered by the existing suites
 //! (`tests/indexscan.rs`, the DML tests) staying correct, not re-pinned here.
 //!
-//! Plus edge coverage beyond the enumerated cases: a NOCASE UNIQUE index (the collation-aware
-//! conflict probe, not the BINARY fast path) and UPDATE OR REPLACE / OR IGNORE resolving a
+//! Plus edge coverage beyond the enumerated cases: a NOCASE UNIQUE index (a conflict probe
+//! that compares under the key column's collation) and UPDATE OR REPLACE / OR IGNORE resolving a
 //! secondary-index UNIQUE conflict (the UPDATE side of the shared victim-cleanup path).
 //!
 //! DML assumes an open write transaction (the engine opens one), so each apply is wrapped in
@@ -783,12 +783,12 @@ fn expression_index_on_wr_table_fails_closed() {
 
 #[test]
 fn unique_index_nocase_collation_detects_case_folded_duplicate() {
-    // A UNIQUE secondary index with a NOCASE key column routes the conflict probe through the
-    // COLLATION-AWARE full scan (`wr_unique_conflict_collated`), NOT the BINARY fast path:
-    // equal-under-collation keys are not adjacent in the BINARY-ordered b-tree, so a prefix
-    // seek would miss them. 'abc' and 'ABC' are a NOCASE duplicate → the second insert errors;
-    // OR IGNORE skips it; a genuinely distinct value inserts. Pins the collated WR probe branch
-    // that every other WR UNIQUE test (all `b INTEGER`, BINARY) leaves unexercised.
+    // A UNIQUE secondary index with a NOCASE key column is ordered under NOCASE, so the
+    // conflict probe's prefix seek must use that order and compare under NOCASE: a BINARY
+    // seek or compare would miss the case-folded duplicate. 'abc' and 'ABC' are a NOCASE
+    // duplicate → the second insert errors; OR IGNORE skips it; a genuinely distinct value
+    // inserts. Pins the collated WR probe that every other WR UNIQUE test (all `b INTEGER`,
+    // BINARY) leaves unexercised.
     let (mut pager, mut cat) =
         db_with_table("CREATE TABLE t(a TEXT PRIMARY KEY, b TEXT) WITHOUT ROWID");
     create_index(&mut cat, &mut pager, "CREATE UNIQUE INDEX u ON t(b COLLATE NOCASE)");

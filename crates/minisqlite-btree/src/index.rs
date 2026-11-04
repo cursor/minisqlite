@@ -42,7 +42,7 @@ use minisqlite_types::{Error, Result};
 use crate::index_build::{
     build_index_interior, build_index_leaf, split_index_interior, split_index_leaf, IndexCell,
 };
-use crate::index_key::{cell_key_bytes, compare_index_keys};
+use crate::index_key::{cell_key_bytes, compare_index_keys, KeyOrder};
 use crate::index_nav::{index_choose_child, index_leaf_search};
 use crate::tree::{put_page, usable_of};
 
@@ -60,11 +60,24 @@ pub fn create_index_btree(pager: &mut dyn Pager) -> Result<PageId> {
 }
 
 /// Insert the encoded index key `key_record` (indexed columns followed by the
-/// rowid) into the index b-tree rooted at `root`, keeping cells in ascending
-/// `compare_index_keys` order. A re-insert of an identical full key is a no-op
-/// (index keys are unique). A key past the inline threshold spills its tail onto a
-/// chain of overflow pages. Runs within whatever transaction the caller has open.
+/// rowid) into an all-ascending BINARY index b-tree rooted at `root`: shorthand for
+/// [`index_insert_with_order`] with [`KeyOrder::default`].
 pub fn index_insert(pager: &mut dyn Pager, root: PageId, key_record: &[u8]) -> Result<()> {
+    index_insert_with_order(pager, root, key_record, &KeyOrder::default())
+}
+
+/// Insert the encoded index key `key_record` (indexed columns followed by the
+/// rowid) into the index b-tree rooted at `root`, keeping cells in ascending
+/// `compare_index_keys` order under `order` (the tree's per-column sort order and
+/// collation). A re-insert of an identical full key is a no-op (index keys are
+/// unique). A key past the inline threshold spills its tail onto a chain of overflow
+/// pages. Runs within whatever transaction the caller has open.
+pub fn index_insert_with_order(
+    pager: &mut dyn Pager,
+    root: PageId,
+    key_record: &[u8],
+    order: &KeyOrder,
+) -> Result<()> {
     let page_size = pager.page_size() as usize;
     let usable = usable_of(pager);
 
@@ -81,7 +94,7 @@ pub fn index_insert(pager: &mut dyn Pager, root: PageId, key_record: &[u8]) -> R
         if view.page_type().is_leaf() {
             break current;
         }
-        let (child, pointer_index) = index_choose_child(pager, &view, key_record, usable)?;
+        let (child, pointer_index) = index_choose_child(pager, &view, key_record, usable, order)?;
         // Classic-B duplicate check: `index_choose_child` returns the first divider
         // `K` with `key_record <= K`. An EXACT match means `key_record` is that
         // interior divider — a real, unique entry that lives here, not in the child
@@ -92,7 +105,7 @@ pub fn index_insert(pager: &mut dyn Pager, root: PageId, key_record: &[u8]) -> R
             let cell = view.index_interior_cell(pointer_index as usize)?;
             let dkey =
                 cell_key_bytes(pager, cell.local_payload, cell.payload_len, cell.overflow_page, usable)?;
-            if compare_index_keys(key_record, dkey.as_ref()) == Ordering::Equal {
+            if compare_index_keys(key_record, dkey.as_ref(), order) == Ordering::Equal {
                 return Ok(());
             }
         }
@@ -106,7 +119,7 @@ pub fn index_insert(pager: &mut dyn Pager, root: PageId, key_record: &[u8]) -> R
     let pos = {
         let data = pager.read_page(leaf_id)?;
         let view = PageView::new(data, leaf_id, usable)?;
-        match index_leaf_search(pager, &view, key_record, usable)? {
+        match index_leaf_search(pager, &view, key_record, usable, order)? {
             Ok(_) => return Ok(()),
             Err(pos) => pos,
         }

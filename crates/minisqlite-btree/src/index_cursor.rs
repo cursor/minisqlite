@@ -36,7 +36,7 @@ use minisqlite_fileformat::PageView;
 use minisqlite_pager::{PageId, Pager};
 use minisqlite_types::{Error, Result};
 
-use crate::index_key::{cell_key_bytes, compare_index_keys};
+use crate::index_key::{cell_key_bytes, compare_index_keys, KeyOrder};
 use crate::index_nav::{index_choose_child, index_leaf_search, index_pointer_at};
 use crate::tree::usable_of;
 
@@ -54,14 +54,28 @@ pub struct IndexCursor<'p> {
     /// index descended.
     stack: Vec<(PageId, u32)>,
     positioned: bool,
+    /// The tree's per-column sort order and collation, used by every seek. `first`,
+    /// `last`, `next`, and `prev` never compare keys, so they do not depend on it.
+    order: KeyOrder,
 }
 
 impl<'p> IndexCursor<'p> {
-    /// Open a cursor over the tree rooted at `root`. Does not position it — call
-    /// `first` / `last` / `seek_ge` / `seek_le` first.
+    /// Open a cursor over the all-ascending BINARY tree rooted at `root`: shorthand
+    /// for [`open_with_order`](Self::open_with_order) with [`KeyOrder::default`].
     pub fn open(pager: &'p dyn Pager, root: PageId) -> Result<IndexCursor<'p>> {
+        Self::open_with_order(pager, root, KeyOrder::default())
+    }
+
+    /// Open a cursor over the tree rooted at `root`, whose keys are ordered by `order`
+    /// (the order the tree was written in). Does not position it — call `first` /
+    /// `last` / `seek_ge` / `seek_le` first.
+    pub fn open_with_order(
+        pager: &'p dyn Pager,
+        root: PageId,
+        order: KeyOrder,
+    ) -> Result<IndexCursor<'p>> {
         let usable = usable_of(pager);
-        Ok(IndexCursor { pager, usable, root, stack: Vec::new(), positioned: false })
+        Ok(IndexCursor { pager, usable, root, stack: Vec::new(), positioned: false, order })
     }
 
     /// Position at the smallest key (descend the left spine). Returns `false`
@@ -94,7 +108,7 @@ impl<'p> IndexCursor<'p> {
             if count == 0 {
                 GeLanding::EmptyTree
             } else {
-                match index_leaf_search(self.pager, &view, key, self.usable)? {
+                match index_leaf_search(self.pager, &view, key, self.usable, &self.order)? {
                     Ok(idx) => GeLanding::At(idx),
                     Err(pos) if pos < count => GeLanding::At(pos),
                     Err(_) => GeLanding::PastLeaf(count - 1),
@@ -151,7 +165,7 @@ impl<'p> IndexCursor<'p> {
         // Positioned at the first entry E >= key. If E == key exactly, E is the answer
         // (largest <= key, since keys are unique). This is the divider fix: when key is
         // an interior divider, seek_ge climbed to it via next(), so key() == key here.
-        if compare_index_keys(self.key()?.as_ref(), key) == std::cmp::Ordering::Equal {
+        if compare_index_keys(self.key()?.as_ref(), key, &self.order) == std::cmp::Ordering::Equal {
             return Ok(true);
         }
         // Otherwise E > key, so the entry just before E is the largest entry < key
@@ -373,7 +387,7 @@ impl<'p> IndexCursor<'p> {
                 if view.page_type().is_leaf() {
                     None
                 } else {
-                    Some(index_choose_child(self.pager, &view, key, self.usable)?)
+                    Some(index_choose_child(self.pager, &view, key, self.usable, &self.order)?)
                 }
             };
             match step {
