@@ -236,9 +236,17 @@ impl<'a> Parser<'a> {
 
     fn parse_default_value(&mut self) -> Result<DefaultValue> {
         if self.eat(&TokenKind::LParen) {
+            let first = self.pos;
             let e = self.parse_expr()?;
+            // The expression's tokens are `first..self.pos`; keep their source text.
+            let text = match self.pos.checked_sub(1) {
+                Some(last) if last >= first => {
+                    self.src[self.tokens[first].start..self.tokens[last].end].to_string()
+                }
+                _ => String::new(),
+            };
             self.expect(&TokenKind::RParen, "')' after DEFAULT expression")?;
-            return Ok(DefaultValue::Expr(Box::new(e)));
+            return Ok(DefaultValue::Expr(Box::new(e), text));
         }
         let neg = if self.eat(&TokenKind::Minus) {
             true

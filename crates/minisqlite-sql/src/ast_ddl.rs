@@ -73,8 +73,10 @@ pub enum ColumnConstraintKind {
 pub enum DefaultValue {
     /// A literal or signed number (sign already folded into the literal).
     Literal(Literal),
-    /// A parenthesized expression: `DEFAULT (expr)`.
-    Expr(Box<Expr>),
+    /// A parenthesized expression: `DEFAULT (expr)`, with the source text between the
+    /// parentheses (outer whitespace trimmed). That text is what sqlite3 reports as
+    /// `dflt_value` and what the INSERT planner re-parses to apply the default.
+    Expr(Box<Expr>, String),
 }
 
 /// A table-level constraint, with its optional `CONSTRAINT name` label.
