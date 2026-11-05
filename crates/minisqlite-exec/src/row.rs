@@ -9,7 +9,7 @@
 
 use minisqlite_catalog::{Catalog, ColumnDef, TableDef};
 use minisqlite_fileformat::{decode_record_into_enc, TextEncoding};
-use minisqlite_types::{DbIndex, Error, Result, Row, Value};
+use minisqlite_types::{affinity_of_declared_type, Affinity, DbIndex, Error, Result, Row, Value};
 
 /// Whether `col` is a VIRTUAL generated column — the executor-side alias for
 /// [`ColumnDef::is_virtual_generated`], which is THE source of truth for "does this column
@@ -21,6 +21,30 @@ use minisqlite_types::{DbIndex, Error, Result, Row, Value};
 /// same method.
 pub(crate) fn is_virtual_generated(col: &ColumnDef) -> bool {
     col.is_virtual_generated()
+}
+
+/// Apply REAL affinity on read to one decoded column value: an INTEGER read from a column
+/// with REAL affinity becomes the equal REAL.
+///
+/// sqlite3 stores a REAL-affinity value that has no fractional part as an integer to save
+/// space and converts it back when the column is read (datatype3.html §3, `OP_RealAffinity`
+/// after `OP_Column` in `sqlite3ColumnDefault`), so a file it wrote holds integer serial
+/// types in REAL columns. Every place that turns stored bytes into a column value (table
+/// rows, WITHOUT ROWID rows, covering index keys, the MIN/MAX index seek) routes through
+/// here. A short row's `ADD COLUMN` default gets the same treatment, as in sqlite3.
+pub(crate) fn real_affinity_on_read(v: &mut Value, col: &ColumnDef) {
+    if let Value::Integer(i) = *v {
+        if affinity_of_declared_type(col.declared_type.as_deref()) == Affinity::Real {
+            *v = Value::Real(i as f64);
+        }
+    }
+}
+
+/// [`real_affinity_on_read`] over a schema-order row prefix `[c0..]` of table `def`.
+pub(crate) fn real_affinity_on_read_row(row: &mut [Value], def: &TableDef) {
+    for (v, col) in row.iter_mut().zip(&def.columns) {
+        real_affinity_on_read(v, col);
+    }
 }
 
 /// Build the `[c0, …, c_{N-1}, rowid]` row (width `N+1`) for one stored record, decoding
@@ -83,6 +107,7 @@ pub(crate) fn decode_table_row_enc(
     for col in &def.columns[row.len()..] {
         row.push(col.default_value.clone().unwrap_or(Value::Null));
     }
+    real_affinity_on_read_row(&mut row, def);
     row.push(Value::Integer(rowid));
     if let Some(i) = def.rowid_alias {
         // The INTEGER PRIMARY KEY column aliases the rowid: its stored value is NULL
@@ -142,6 +167,7 @@ pub(crate) fn decode_table_row_skipping_virtual_enc(
             row.push(stored.next().unwrap_or_else(|| col.default_value.clone().unwrap_or(Value::Null)));
         }
     }
+    real_affinity_on_read_row(&mut row, def);
     row.push(Value::Integer(rowid));
     if let Some(i) = def.rowid_alias {
         debug_assert!(i < n, "rowid_alias {i} out of range for {n}-column table");
