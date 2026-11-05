@@ -29,14 +29,18 @@ pub fn affinity_of_declared_type(decl: Option<&str>) -> Affinity {
         Some(d) => d,
         None => return Affinity::Blob,
     };
-    let up = decl.to_ascii_uppercase();
-    if up.contains("INT") {
+    // Case-insensitive substring test without allocating an upper-cased copy: the row
+    // decoder calls this per stored INTEGER value to apply REAL affinity on read.
+    let has = |pat: &str| {
+        decl.as_bytes().windows(pat.len()).any(|w| w.eq_ignore_ascii_case(pat.as_bytes()))
+    };
+    if has("INT") {
         Affinity::Integer
-    } else if up.contains("CHAR") || up.contains("CLOB") || up.contains("TEXT") {
+    } else if has("CHAR") || has("CLOB") || has("TEXT") {
         Affinity::Text
-    } else if up.contains("BLOB") || up.trim().is_empty() {
+    } else if has("BLOB") || decl.trim().is_empty() {
         Affinity::Blob
-    } else if up.contains("REAL") || up.contains("FLOA") || up.contains("DOUB") {
+    } else if has("REAL") || has("FLOA") || has("DOUB") {
         Affinity::Real
     } else {
         Affinity::Numeric

@@ -19,7 +19,7 @@ use minisqlite_plan::{MinMaxSeek, MinMaxSource};
 use minisqlite_types::{Error, Result, Row, Value};
 
 use crate::env::Env;
-use crate::row::resolve_table;
+use crate::row::{real_affinity_on_read, resolve_table};
 use crate::runtime::Runtime;
 use crate::RowCursor;
 
@@ -92,7 +92,16 @@ fn compute_extremum(node: &MinMaxSeek, env: Env<'_>) -> Result<Value> {
             );
             let enc = text_encoding_of(pager);
             let mut cur = IndexCursor::open(pager, def.root_page)?;
-            index_extremum(&mut cur, node.is_max, enc)
+            let mut v = index_extremum(&mut cur, node.is_max, enc)?;
+            // The key column is a plain table column (asserted above), so its stored value
+            // gets the column's REAL affinity on read, the same as a table scan applies.
+            let table = resolve_table(env.catalog, node.db, &node.table)?;
+            if let Some(col) = def.columns.first().and_then(|name| {
+                table.columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))
+            }) {
+                real_affinity_on_read(&mut v, col);
+            }
+            Ok(v)
         }
     }
 }
@@ -128,8 +137,8 @@ fn index_extremum(cur: &mut IndexCursor, is_max: bool, enc: TextEncoding) -> Res
 /// Decode the left-most key column of the entry the cursor is on. An index key is a record
 /// `[key_cols.., rowid]`; the extremum is its first column. Decoded with the database's TEXT
 /// encoding (§1.3.13) so a UTF-16 file's TEXT transcodes to UTF-8 — byte-identical to the
-/// value the table row decodes to (same stored bytes, same encoding, no per-column affinity
-/// re-applied on either path).
+/// value the table row decodes to (same stored bytes, same encoding); the caller then applies
+/// the column's REAL affinity on read, as the table decode does.
 fn leftmost_key(cur: &IndexCursor, enc: TextEncoding) -> Result<Value> {
     let key = cur.key()?;
     Ok(decode_record_enc(key.as_ref(), enc).into_iter().next().unwrap_or(Value::Null))

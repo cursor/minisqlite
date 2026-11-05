@@ -59,7 +59,10 @@ use crate::ops::dml_index::{build_index_plan, wr_entry_pk, IndexPlan};
 use crate::ops::generated::compute_generated;
 use crate::ops::with_outer;
 use crate::ops::without_rowid::{wr_layout, WrLayout};
-use crate::row::{decode_table_row_enc, decode_table_row_skipping_virtual_enc, resolve_base_table};
+use crate::row::{
+    decode_table_row_enc, decode_table_row_skipping_virtual_enc, real_affinity_on_read_row,
+    resolve_base_table,
+};
 use crate::runtime::Runtime;
 use crate::RowCursor;
 
@@ -608,6 +611,9 @@ impl IndexScanCursor<'_> {
                     local[reg] = v.clone();
                 }
             }
+            // The index key holds the column's stored value, so REAL affinity applies on
+            // read here exactly as it does on the table fetch below.
+            real_affinity_on_read_row(&mut local[..n], self.table);
             local[n] = Value::Integer(rowid);
             return Ok(with_outer(self.outer, local));
         }

@@ -132,6 +132,7 @@ impl WrLayout {
         for &schema_i in &self.perm[take..] {
             row[schema_i] = def.columns[schema_i].default_value.clone().unwrap_or(Value::Null);
         }
+        crate::row::real_affinity_on_read_row(&mut row, def);
         row
     }
 
