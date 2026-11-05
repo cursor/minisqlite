@@ -333,7 +333,9 @@ impl SqlEngine {
             // instead of at statement time. UNLIKE `foreign_keys`, the SET form IS honored
             // inside a transaction (deferring all FKs for that transaction is its entire
             // purpose), and it is AUTOMATICALLY switched OFF at each COMMIT and ROLLBACK
-            // (reset in `exec_commit`/`exec_rollback`). SQLite defaults it OFF. GET reports
+            // (reset in `exec_commit`/`exec_rollback` and when an autocommit statement's
+            // implicit transaction ends). A value set before `BEGIN` applies to that
+            // transaction. SQLite defaults it OFF. GET reports
             // 0/1; it is a connection/transaction-level flag on the [`Runtime`], not a page-1
             // header byte. It only has an observable enforcement effect while a transaction
             // is open (in autocommit there is nothing to defer into), matching real sqlite.
@@ -344,7 +346,14 @@ impl SqlEngine {
                 ))),
                 Some(a) => {
                     let on = pragma_arg_to_bool(a)?;
-                    self.rt.set_defer_foreign_keys(on);
+                    if !on && !self.txn_active() {
+                        // Outside a transaction nothing has been deferred yet, so OFF also
+                        // drops the sticky commit-coverage flag; otherwise an ON then OFF
+                        // here would still widen the next transaction's COMMIT recheck.
+                        self.rt.reset_defer_foreign_keys();
+                    } else {
+                        self.rt.set_defer_foreign_keys(on);
+                    }
                     Ok(None)
                 }
             },

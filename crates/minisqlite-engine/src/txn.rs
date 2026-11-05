@@ -49,11 +49,11 @@ impl SqlEngine {
         if self.txn_active() {
             return Err(Error::sql("cannot start a transaction within a transaction"));
         }
-        // `PRAGMA defer_foreign_keys` must be "separately enabled for each transaction"
-        // (pragma.html #pragma_defer_foreign_keys): clear any value a stray autocommit
-        // `PRAGMA defer_foreign_keys = ON` (which had no transaction to defer into) left set,
-        // so it cannot leak into and wrongly defer THIS transaction's FKs.
-        self.rt.reset_defer_foreign_keys();
+        // `PRAGMA defer_foreign_keys` is NOT cleared here: a value set just before `BEGIN`
+        // applies to this transaction, as in sqlite3. It is switched off when a transaction
+        // ends (pragma.html #pragma_defer_foreign_keys: "at each COMMIT or ROLLBACK"),
+        // including the implicit one around an autocommit statement, so no stale value from
+        // an earlier transaction can reach here.
         // An explicit transaction spans EVERY live namespace so a later COMMIT/ROLLBACK
         // covers temp writes too. `main` (index 0) governs WAL concurrency via the mode
         // and is begun first, so an IMMEDIATE `BEGIN` that hits SQLITE_BUSY there aborts
@@ -205,6 +205,9 @@ impl SqlEngine {
     /// closed; only the pagers after it remain open.) Per-pager rollback errors are swallowed
     /// so they cannot mask the original commit error.
     pub(crate) fn implicit_commit_all(&mut self) -> Result<()> {
+        // The implicit transaction ends here (committed, or rolled back on failure), so
+        // `PRAGMA defer_foreign_keys` switches off, as at an explicit COMMIT.
+        self.rt.reset_defer_foreign_keys();
         for i in 0..self.pagers.len() {
             if let Err(e) = self.pagers[i].commit() {
                 for j in (i + 1)..self.pagers.len() {
@@ -224,6 +227,9 @@ impl SqlEngine {
     /// holds the statement's own error to return, and a rollback of an un-dirtied pager
     /// cannot fail anyway (it just drops an empty overlay and releases the write lock).
     pub(crate) fn implicit_rollback_all(&mut self) {
+        // Ending the implicit transaction switches `PRAGMA defer_foreign_keys` off, as at an
+        // explicit ROLLBACK.
+        self.rt.reset_defer_foreign_keys();
         for i in 0..self.pagers.len() {
             let _ = self.pagers[i].rollback();
         }
@@ -235,14 +241,9 @@ impl SqlEngine {
     /// shadow: a later `RELEASE`/`ROLLBACK TO` resolves to the MOST RECENT savepoint
     /// with that name.
     pub(crate) fn exec_savepoint(&mut self, name: &str) -> Result<()> {
-        // A SAVEPOINT issued in autocommit STARTS a transaction. Like `BEGIN`, clear any
-        // `PRAGMA defer_foreign_keys` a stray autocommit set left on, so the pragma is honored
-        // "separately for each transaction" (pragma.html #pragma_defer_foreign_keys) and cannot
-        // leak into this one. A nested savepoint (a transaction already active) must NOT reset —
-        // that would drop a deferral the enclosing transaction deliberately turned on.
-        if !self.txn_active() {
-            self.rt.reset_defer_foreign_keys();
-        }
+        // Like `BEGIN`, a SAVEPOINT that starts a transaction keeps a `PRAGMA
+        // defer_foreign_keys` set just before it, and a nested one keeps the enclosing
+        // transaction's value.
         // Open the savepoint on EVERY live namespace so a later RELEASE / ROLLBACK TO
         // spans temp too. The per-pager stacks are kept in lockstep — every savepoint op
         // is applied to all live pagers, and a temp store created mid-transaction replays
@@ -407,6 +408,9 @@ impl SqlEngine {
             return f(&mut self.catalogs[i], &mut *self.pagers[i]);
         }
         self.pagers[i].begin()?;
+        // The implicit transaction ends below either way, which switches `PRAGMA
+        // defer_foreign_keys` off (as at COMMIT / ROLLBACK).
+        self.rt.reset_defer_foreign_keys();
         match f(&mut self.catalogs[i], &mut *self.pagers[i]) {
             Ok(()) => self.pagers[i].commit(),
             Err(e) => {

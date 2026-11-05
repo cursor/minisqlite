@@ -33,9 +33,10 @@
 //! is "subject to the same restrictions as a COMMIT"), and over BOTH rowid and WITHOUT ROWID
 //! children. `SET DEFAULT` — whose post-action re-check can leave a child-side violation — is
 //! deferred like NO ACTION (only RESTRICT stays immediate). `PRAGMA defer_foreign_keys` is
-//! "separately enabled for each transaction": it clears at COMMIT/ROLLBACK and at the START of
-//! a transaction (so a stray autocommit set does not leak in), and its coverage is STICKY —
-//! toggling it OFF mid-transaction still rescans a row it deferred while ON.
+//! switched off at each COMMIT/ROLLBACK, including the implicit one that ends an autocommit
+//! statement, but not at the START of a transaction (a value set just before `BEGIN` applies
+//! to it, as in sqlite3 3.51.3), and its coverage is STICKY — toggling it OFF mid-transaction
+//! still rescans a row it deferred while ON.
 //!
 //! REMAINING honest gaps (fail-closed or pre-existing, IDENTICAL in the immediate and deferred
 //! paths, so deferred is never weaker than immediate):
@@ -499,39 +500,195 @@ fn defer_pragma_toggled_off_midtxn_still_fails_commit() {
     assert_scalar(&mut db, "SELECT count(*) FROM cf", int(0));
 }
 
+/// Parent/child pair with an ordinary (NOT DEFERRABLE) FK, `foreign_keys` ON.
+fn defer_pragma_schema(db: &mut Connection) {
+    exec(db, "PRAGMA foreign_keys = ON");
+    exec(db, "CREATE TABLE pf(id INTEGER PRIMARY KEY)");
+    exec(db, "CREATE TABLE cf(id INTEGER PRIMARY KEY, pid REFERENCES pf(id))");
+}
+
 #[test]
-fn defer_pragma_set_in_autocommit_does_not_leak_into_next_txn() {
-    // pragma.html: defer_foreign_keys "must be separately enabled for each transaction". A set
-    // in AUTOCOMMIT (no transaction to defer into) must not carry into a later BEGIN, or it
-    // would wrongly defer that transaction's FKs. The flag is reset at the start of a txn.
+fn defer_pragma_set_before_begin_applies_to_the_transaction() {
+    // pragma.html: the pragma "is automatically switched off at each COMMIT or ROLLBACK";
+    // BEGIN does not switch it off. sqlite3 3.51.3 keeps a value set before BEGIN and defers
+    // the orphan INSERT to COMMIT.
     let mut db = mem();
-    exec(&mut db, "PRAGMA foreign_keys = ON");
-    exec(&mut db, "CREATE TABLE pf(id INTEGER PRIMARY KEY)");
-    exec(&mut db, "CREATE TABLE cf(id INTEGER PRIMARY KEY, pid REFERENCES pf(id))");
-    exec(&mut db, "PRAGMA defer_foreign_keys = 1"); // set in autocommit — nothing to defer
-    exec(&mut db, "BEGIN"); // must clear the stray set
+    defer_pragma_schema(&mut db);
+    exec(&mut db, "PRAGMA defer_foreign_keys = ON");
+    exec(&mut db, "BEGIN");
+    assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(1));
+    exec(&mut db, "INSERT INTO cf VALUES (1, 99)"); // deferred, resolved below
+    exec(&mut db, "INSERT INTO pf VALUES (99)");
+    exec(&mut db, "COMMIT");
     assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(0));
-    // No leaked deferral → the immediate FK is enforced at the INSERT, not deferred to COMMIT.
+    assert_rows(&mut db, "SELECT id, pid FROM cf", &[vec![int(1), int(99)]]);
+}
+
+#[test]
+fn defer_pragma_set_before_savepoint_applies_to_the_transaction() {
+    // The SAVEPOINT-started analog: the value set before it applies, and the RELEASE that
+    // commits the transaction switches it off (sqlite3 3.51.3).
+    let mut db = mem();
+    defer_pragma_schema(&mut db);
+    exec(&mut db, "PRAGMA defer_foreign_keys = ON");
+    exec(&mut db, "SAVEPOINT s");
+    assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(1));
+    exec(&mut db, "INSERT INTO cf VALUES (1, 99)");
+    exec(&mut db, "INSERT INTO pf VALUES (99)");
+    exec(&mut db, "RELEASE s");
+    assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(0));
+    assert_scalar(&mut db, "SELECT count(*) FROM cf", int(1));
+}
+
+#[test]
+fn defer_pragma_set_before_begin_is_switched_off_by_rollback() {
+    let mut db = mem();
+    defer_pragma_schema(&mut db);
+    exec(&mut db, "PRAGMA defer_foreign_keys = ON");
+    exec(&mut db, "BEGIN");
+    exec(&mut db, "ROLLBACK");
+    assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(0));
+}
+
+#[test]
+fn defer_pragma_switched_off_by_autocommit_insert() {
+    // An autocommit INSERT commits its own implicit transaction, which switches the pragma
+    // off (sqlite3 3.51.3 reports 0), so it no longer applies to a later BEGIN.
+    let mut db = mem();
+    defer_pragma_schema(&mut db);
+    exec(&mut db, "PRAGMA defer_foreign_keys = ON");
+    exec(&mut db, "INSERT INTO pf VALUES (5)");
+    assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(0));
+    exec(&mut db, "BEGIN");
     let e = assert_exec_error(&mut db, "INSERT INTO cf VALUES (1, 99)");
     assert!(e.to_string().contains("FOREIGN KEY constraint failed"), "got: {e}");
     exec(&mut db, "ROLLBACK");
 }
 
 #[test]
-fn defer_pragma_set_in_autocommit_does_not_leak_into_savepoint_txn() {
-    // The SAVEPOINT-started analog of the BEGIN reset: a SAVEPOINT that OPENS a transaction from
-    // autocommit must also clear a stray autocommit `PRAGMA defer_foreign_keys` set, so it does
-    // not leak into and wrongly defer the savepoint transaction's FKs.
+fn defer_pragma_switched_off_by_autocommit_update_delete_and_ddl() {
     let mut db = mem();
-    exec(&mut db, "PRAGMA foreign_keys = ON");
-    exec(&mut db, "CREATE TABLE pf(id INTEGER PRIMARY KEY)");
-    exec(&mut db, "CREATE TABLE cf(id INTEGER PRIMARY KEY, pid REFERENCES pf(id))");
-    exec(&mut db, "PRAGMA defer_foreign_keys = 1"); // set in autocommit — nothing to defer
-    exec(&mut db, "SAVEPOINT s"); // opens a transaction → must clear the stray set
+    defer_pragma_schema(&mut db);
+    exec(&mut db, "INSERT INTO pf VALUES (1)");
+    exec(&mut db, "PRAGMA defer_foreign_keys = ON");
+    exec(&mut db, "UPDATE pf SET id = 1");
     assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(0));
+    exec(&mut db, "PRAGMA defer_foreign_keys = ON");
+    exec(&mut db, "DELETE FROM pf WHERE 0");
+    assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(0));
+    exec(&mut db, "PRAGMA defer_foreign_keys = ON");
+    exec(&mut db, "CREATE TABLE z(a)");
+    assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(0));
+    exec(&mut db, "PRAGMA defer_foreign_keys = ON");
+    exec(&mut db, "CREATE TABLE z2 AS SELECT 1 AS a");
+    assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(0));
+}
+
+#[test]
+fn defer_pragma_switched_off_by_failed_autocommit_statement() {
+    // A statement that fails while running rolls back its implicit transaction, which also
+    // switches the pragma off (sqlite3 3.51.3). In autocommit the FK is still checked at the
+    // statement, so the orphan is rejected.
+    let mut db = mem();
+    defer_pragma_schema(&mut db);
+    exec(&mut db, "PRAGMA defer_foreign_keys = ON");
     let e = assert_exec_error(&mut db, "INSERT INTO cf VALUES (1, 99)");
     assert!(e.to_string().contains("FOREIGN KEY constraint failed"), "got: {e}");
+    assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(0));
+    assert_scalar(&mut db, "SELECT count(*) FROM cf", int(0));
+
+    exec(&mut db, "CREATE TABLE u(x UNIQUE)");
+    exec(&mut db, "INSERT INTO u VALUES (1)");
+    exec(&mut db, "PRAGMA defer_foreign_keys = ON");
+    let e = assert_exec_error(&mut db, "INSERT INTO u VALUES (1)");
+    assert!(e.to_string().contains("UNIQUE constraint failed"), "got: {e}");
+    assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(0));
+}
+
+#[test]
+fn defer_pragma_kept_by_statements_that_open_no_transaction() {
+    // sqlite3 3.51.3 keeps the value across a statement that touches no table and across a
+    // statement rejected before it runs (no such table).
+    let mut db = mem();
+    defer_pragma_schema(&mut db);
+    exec(&mut db, "PRAGMA defer_foreign_keys = ON");
+    assert_scalar(&mut db, "PRAGMA foreign_keys", int(1));
+    assert_scalar(&mut db, "SELECT 1", int(1));
+    assert_exec_error(&mut db, "INSERT INTO nosuch VALUES (1)");
+    assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(1));
+}
+
+#[test]
+fn defer_pragma_on_then_off_in_autocommit_defers_nothing() {
+    // ON then OFF before BEGIN leaves nothing deferred: the orphan errors at the INSERT, and
+    // a row that violated the FK before `foreign_keys` was turned on does not fail COMMIT
+    // (sqlite3 3.51.3).
+    let mut db = mem();
+    exec(&mut db, "CREATE TABLE pf(id INTEGER PRIMARY KEY)");
+    exec(&mut db, "CREATE TABLE cf(id INTEGER PRIMARY KEY, pid REFERENCES pf(id))");
+    exec(&mut db, "INSERT INTO cf VALUES (1, 42)"); // foreign_keys still OFF
+    exec(&mut db, "PRAGMA foreign_keys = ON");
+    exec(&mut db, "PRAGMA defer_foreign_keys = ON");
+    exec(&mut db, "PRAGMA defer_foreign_keys = OFF");
+    exec(&mut db, "BEGIN");
+    assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(0));
+    let e = assert_exec_error(&mut db, "INSERT INTO cf VALUES (2, 99)");
+    assert!(e.to_string().contains("FOREIGN KEY constraint failed"), "got: {e}");
+    exec(&mut db, "INSERT INTO pf VALUES (2)");
+    exec(&mut db, "COMMIT");
+    assert_scalar(&mut db, "SELECT count(*) FROM pf", int(1));
+}
+
+#[test]
+fn defer_pragma_kept_after_failed_commit() {
+    // A COMMIT that fails on a deferred violation leaves the transaction open (§4.2) and,
+    // in sqlite3 3.51.3, leaves the pragma ON; the COMMIT that succeeds switches it off.
+    let mut db = mem();
+    defer_pragma_schema(&mut db);
+    exec(&mut db, "PRAGMA defer_foreign_keys = ON");
+    exec(&mut db, "BEGIN");
+    exec(&mut db, "INSERT INTO cf VALUES (1, 99)");
+    let e = assert_exec_error(&mut db, "COMMIT");
+    assert!(e.to_string().contains("FOREIGN KEY constraint failed"), "got: {e}");
+    assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(1));
+    exec(&mut db, "INSERT INTO pf VALUES (99)");
+    exec(&mut db, "COMMIT");
+    assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(0));
+    assert_scalar(&mut db, "SELECT count(*) FROM cf", int(1));
+}
+
+#[test]
+fn defer_pragma_kept_after_failed_release() {
+    let mut db = mem();
+    defer_pragma_schema(&mut db);
+    exec(&mut db, "PRAGMA defer_foreign_keys = ON");
+    exec(&mut db, "SAVEPOINT s");
+    exec(&mut db, "INSERT INTO cf VALUES (1, 99)");
+    let e = assert_exec_error(&mut db, "RELEASE s");
+    assert!(e.to_string().contains("FOREIGN KEY constraint failed"), "got: {e}");
+    assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(1));
     exec(&mut db, "ROLLBACK");
+    assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(0));
+    assert_scalar(&mut db, "SELECT count(*) FROM cf", int(0));
+}
+
+#[test]
+fn defer_pragma_kept_by_rollback_to_and_nested_release() {
+    // ROLLBACK TO and a nested RELEASE do not end the transaction, so the pragma stays ON
+    // until the real COMMIT (sqlite3 3.51.3). The pragma is not itself rolled back by
+    // ROLLBACK TO a savepoint opened before it was set.
+    let mut db = mem();
+    defer_pragma_schema(&mut db);
+    exec(&mut db, "BEGIN");
+    exec(&mut db, "SAVEPOINT s");
+    exec(&mut db, "PRAGMA defer_foreign_keys = ON");
+    exec(&mut db, "INSERT INTO cf VALUES (1, 99)");
+    exec(&mut db, "ROLLBACK TO s");
+    assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(1));
+    exec(&mut db, "RELEASE s");
+    assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(1));
+    exec(&mut db, "COMMIT");
+    assert_scalar(&mut db, "PRAGMA defer_foreign_keys", int(0));
     assert_scalar(&mut db, "SELECT count(*) FROM cf", int(0));
 }
 
