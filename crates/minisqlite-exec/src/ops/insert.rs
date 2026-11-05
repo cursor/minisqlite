@@ -283,10 +283,8 @@ impl InsertCursor<'_> {
             let (mut rowid, explicit) = match coerced {
                 MustBeInt::Int(i) => (i, true),
                 MustBeInt::Null => {
-                    let r = next_auto.checked_add(1).ok_or_else(|| {
-                        Error::sql("rowid space exhausted (auto-increment past i64::MAX)")
-                    })?;
-                    (r, false)
+                    let pager = self.pagers.target(node.db)?;
+                    (auto_rowid(next_auto, autoincrement, &*pager, root)?, false)
                 }
                 MustBeInt::NotInt => return Err(datatype_mismatch()),
             };
@@ -397,9 +395,15 @@ impl InsertCursor<'_> {
                     let mut tc = TableCursor::open(&*pager, root)?;
                     if tc.last()? { tc.rowid() } else { 0 }
                 };
-                let rederived = next_auto.max(live_max).checked_add(1).ok_or_else(|| {
-                    Error::sql("rowid space exhausted (auto-increment past i64::MAX)")
-                })?;
+                // Past i64::MAX the row holds a random rowid, which only needs replacing if
+                // the trigger happened to take it.
+                let rederived = match next_auto.max(live_max).checked_add(1) {
+                    Some(r) => r,
+                    None if TableCursor::open(&*pager, root)?.seek_exact(rowid)? => {
+                        auto_rowid(i64::MAX, autoincrement, &*pager, root)?
+                    }
+                    None => rowid,
+                };
                 if rederived != rowid {
                     rowid = rederived;
                     if let Some(ai) = alias {
@@ -1134,6 +1138,34 @@ fn clean_source_row(src_row: &[Value], source_width: usize) -> Result<&[Value]> 
         .checked_sub(source_width)
         .map(|start| &src_row[start..])
         .ok_or_else(|| Error::sql("INSERT source row narrower than source_width"))
+}
+
+/// The rowid for an auto-assigned row, given `high`, the largest rowid in use (for
+/// AUTOINCREMENT, also the largest ever used). Normally `high + 1`. Once `high` is
+/// i64::MAX, autoinc.html: without AUTOINCREMENT "the database engine starts picking
+/// positive candidate ROWIDs at random until it finds one that is not previously used";
+/// with AUTOINCREMENT the insert fails with SQLITE_FULL. Like sqlite3 (`OP_NewRowid`),
+/// candidates are drawn from 1..=2^62 and the search gives up with SQLITE_FULL after 100
+/// used candidates. They come from an OS-seeded `RandomState`, not the connection's
+/// fixed-seed `random()` generator, which would hand every new connection the same
+/// candidates (and leave `random()` sequences dependent on inserts).
+fn auto_rowid(high: i64, autoincrement: bool, pager: &dyn Pager, root: PageId) -> Result<i64> {
+    use std::hash::{BuildHasher, RandomState};
+
+    if let Some(next) = high.checked_add(1) {
+        return Ok(next);
+    }
+    if !autoincrement {
+        let mut tc = TableCursor::open(pager, root)?;
+        let state = RandomState::new();
+        for attempt in 0..100u32 {
+            let candidate = (state.hash_one(attempt) as i64 & (i64::MAX >> 1)) + 1;
+            if !tc.seek_exact(candidate)? {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(Error::sql("database or disk is full"))
 }
 
 /// Map one source row onto the `N` target columns. With an explicit `columns` list,

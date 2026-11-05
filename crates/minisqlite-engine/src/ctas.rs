@@ -112,6 +112,9 @@ impl SqlEngine {
         let wrap = !self.txn_active();
         if wrap {
             self.pagers[di].begin()?;
+            // The implicit transaction ends below either way, which switches `PRAGMA
+            // defer_foreign_keys` off (as at COMMIT / ROLLBACK).
+            self.rt.reset_defer_foreign_keys();
         }
         match self.ctas_create_and_populate(db, &synth_ct, &synth_source, &insert_stmt) {
             Ok(()) => {

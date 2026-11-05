@@ -230,7 +230,8 @@ pub struct Runtime {
     /// a transaction is open ([`fk_defer_active`](Runtime::fk_defer_active)), EVERY FK — not
     /// only the declared-deferred ones — is checked at COMMIT rather than at statement time.
     /// It is automatically switched OFF at each COMMIT and ROLLBACK (the engine resets it in
-    /// `exec_commit`/`exec_rollback`), so it never leaks past the transaction that set it.
+    /// `exec_commit`/`exec_rollback` and at the end of each autocommit statement's implicit
+    /// transaction), so it never leaks past the transaction it applied to.
     /// SQLite defaults it OFF; a RESTRICT action stays immediate even under it
     /// (`foreignkeys.html` §4.3), which the enforcement paths handle by never routing RESTRICT
     /// through the deferral predicate.
@@ -239,7 +240,7 @@ pub struct Runtime {
     /// recheck's coverage flag, distinct from the LIVE [`defer_foreign_keys`] the per-statement
     /// skip reads. It is set true whenever `defer_foreign_keys` is turned ON and, unlike the
     /// live flag, is NOT cleared when the pragma is toggled back OFF mid-transaction — only at
-    /// transaction end/start (`reset_defer_foreign_keys`). This closes a desync: a row allowed
+    /// transaction end (`reset_defer_foreign_keys`). This closes a desync: a row allowed
     /// to sit orphaned while the pragma was ON must still be RESCANNED at COMMIT even if the
     /// pragma was turned OFF before COMMIT, or an FK-violating row would commit with
     /// `foreign_keys` ON — contradicting §4.2 ("COMMIT will fail as long as foreign key
@@ -579,7 +580,7 @@ impl Runtime {
     /// [`defer_foreign_keys_armed`](Runtime::defer_foreign_keys_armed) coverage flag so the
     /// COMMIT recheck still rescans even if the pragma is later toggled OFF in the same txn;
     /// turning it OFF leaves the sticky flag set (coverage only grows within a txn). Use
-    /// [`reset_defer_foreign_keys`](Runtime::reset_defer_foreign_keys) at transaction end/start
+    /// [`reset_defer_foreign_keys`](Runtime::reset_defer_foreign_keys) at transaction end
     /// to clear BOTH.
     pub fn set_defer_foreign_keys(&mut self, on: bool) {
         self.defer_foreign_keys = on;
@@ -598,11 +599,12 @@ impl Runtime {
     }
 
     /// Clear BOTH the live `defer_foreign_keys` flag and its sticky
-    /// [`defer_foreign_keys_armed`](Runtime::defer_foreign_keys_armed) coverage flag. Called at
-    /// each transaction boundary — COMMIT, ROLLBACK, and the START of a transaction (`BEGIN` /
-    /// a savepoint that opens one) — so the pragma is "separately enabled for each transaction"
-    /// (`pragma.html` #pragma_defer_foreign_keys) and never leaks from one txn (or a stray
-    /// autocommit set) into the next.
+    /// [`defer_foreign_keys_armed`](Runtime::defer_foreign_keys_armed) coverage flag. Called
+    /// whenever a transaction ends — COMMIT, ROLLBACK, a RELEASE that commits, and the end of
+    /// an autocommit statement's implicit transaction — since the pragma "is automatically
+    /// switched off at each COMMIT or ROLLBACK" (`pragma.html` #pragma_defer_foreign_keys).
+    /// The start of a transaction does NOT reset it, so a value set just before `BEGIN`
+    /// applies to that transaction, as in sqlite3.
     pub fn reset_defer_foreign_keys(&mut self) {
         self.defer_foreign_keys = false;
         self.defer_foreign_keys_armed = false;
