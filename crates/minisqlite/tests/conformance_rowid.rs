@@ -572,6 +572,134 @@ fn explicit_negative_rowid_on_integer_primary_key_is_stored() {
 }
 
 // ===========================================================================
+// 5b) Auto rowid once the largest rowid is i64::MAX — autoinc.html.
+// "If the largest ROWID is equal to the largest possible integer
+// (9223372036854775807) then the database engine starts picking positive
+// candidate ROWIDs at random until it finds one that is not previously used."
+// With AUTOINCREMENT the insert fails with SQLITE_FULL instead. The random value
+// cannot be asserted, so these pin what sqlite3 3.51.3 guarantees: the row goes
+// in under a positive, unused rowid, and `last_insert_rowid()` reports it.
+// ===========================================================================
+
+#[test]
+fn integer_primary_key_auto_rowid_after_max_picks_an_unused_positive_rowid() {
+    let mut db = mem();
+    exec(&mut db, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)");
+    exec(&mut db, "INSERT INTO t VALUES (9223372036854775807, 'max')");
+    exec(&mut db, "INSERT INTO t(v) VALUES ('next')");
+    assert_scalar(&mut db, "SELECT count(*) FROM t", int(2));
+    assert_scalar(&mut db, "SELECT id > 0 AND id < 9223372036854775807 FROM t WHERE v = 'next'", int(1));
+    assert_scalar(&mut db, "SELECT last_insert_rowid() = (SELECT id FROM t WHERE v = 'next')", int(1));
+    assert_scalar(&mut db, "SELECT v FROM t WHERE id = 9223372036854775807", text("max"));
+}
+
+#[test]
+fn repeated_auto_rowids_after_max_all_succeed_and_stay_unique() {
+    let mut db = mem();
+    exec(&mut db, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)");
+    exec(&mut db, "INSERT INTO t VALUES (9223372036854775807, 'max')");
+    for i in 0..50 {
+        exec(&mut db, &format!("INSERT INTO t(v) VALUES ('s{i}')"));
+        assert_scalar(&mut db, &format!("SELECT last_insert_rowid() = (SELECT id FROM t WHERE v = 's{i}')"), int(1));
+    }
+    // A multi-row INSERT keeps drawing random rowids for every row.
+    exec(&mut db, "INSERT INTO t(v) VALUES ('m0'), ('m1'), ('m2'), ('m3'), ('m4')");
+    assert_scalar(&mut db, "SELECT last_insert_rowid() = (SELECT id FROM t WHERE v = 'm4')", int(1));
+    assert_rows(
+        &mut db,
+        "SELECT count(*), count(DISTINCT id), min(id) > 0, max(id) FROM t",
+        &[vec![int(56), int(56), int(1), int(9223372036854775807)]],
+    );
+}
+
+#[test]
+fn plain_rowid_table_auto_rowid_after_max_picks_an_unused_positive_rowid() {
+    let mut db = mem();
+    exec(&mut db, "CREATE TABLE r(v)");
+    exec(&mut db, "INSERT INTO r(rowid, v) VALUES (9223372036854775807, 'max')");
+    exec(&mut db, "INSERT INTO r(v) VALUES ('a')");
+    exec(&mut db, "INSERT INTO r(v) VALUES ('b')");
+    assert_rows(&mut db, "SELECT count(*), count(DISTINCT rowid), min(rowid) > 0 FROM r", &[vec![int(3), int(3), int(1)]]);
+    assert_scalar(&mut db, "SELECT last_insert_rowid() = (SELECT rowid FROM r WHERE v = 'b')", int(1));
+}
+
+#[test]
+fn auto_rowid_reaches_max_then_switches_to_random_within_one_statement() {
+    // The first auto row takes max+1 = i64::MAX; the next one in the same statement
+    // has no max+1 left and gets a random unused rowid (sqlite3 3.51.3: count 3, max(id)
+    // i64::MAX).
+    let mut db = mem();
+    exec(&mut db, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)");
+    exec(&mut db, "INSERT INTO t VALUES (9223372036854775806, 'a')");
+    exec(&mut db, "INSERT INTO t(v) VALUES ('b'), ('c')");
+    assert_scalar(&mut db, "SELECT v FROM t WHERE id = 9223372036854775807", text("b"));
+    assert_scalar(&mut db, "SELECT id > 0 AND id < 9223372036854775806 FROM t WHERE v = 'c'", int(1));
+    assert_scalar(&mut db, "SELECT count(*) FROM t", int(3));
+}
+
+#[test]
+fn auto_rowid_after_max_with_before_trigger_present() {
+    // A table with a BEFORE INSERT trigger goes through the re-derive step after the
+    // trigger fires; the random rowid must survive it.
+    let mut db = mem();
+    exec(&mut db, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)");
+    exec(&mut db, "CREATE TABLE log(x)");
+    exec(&mut db, "CREATE TRIGGER tb BEFORE INSERT ON t BEGIN INSERT INTO log VALUES (NEW.v); END");
+    exec(&mut db, "INSERT INTO t VALUES (9223372036854775807, 'max')");
+    exec(&mut db, "INSERT INTO t(v) VALUES ('a'), ('b')");
+    assert_rows(&mut db, "SELECT count(*), count(DISTINCT id), min(id) > 0 FROM t", &[vec![int(3), int(3), int(1)]]);
+    assert_scalar(&mut db, "SELECT count(*) FROM log", int(3));
+}
+
+#[test]
+fn auto_rowids_after_max_do_not_repeat_across_connections() {
+    // Each new connection must draw fresh candidates. With the same candidate sequence
+    // per connection, the 101st connection would find its first 100 candidates taken and
+    // fail with "database or disk is full".
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(self.0.with_extension("db-journal"));
+        }
+    }
+    let path = std::env::temp_dir().join(format!("minisqlite_rowid_max_{}.db", std::process::id()));
+    let guard = Cleanup(path.clone());
+    drop(Cleanup(path.clone())); // clear a stale file from an earlier run
+    let open = || Connection::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e:?}"));
+    let mut db = open();
+    exec(&mut db, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)");
+    exec(&mut db, "INSERT INTO t VALUES (9223372036854775807, 'max')");
+    drop(db);
+    for i in 0..120 {
+        let mut db = open();
+        exec(&mut db, &format!("INSERT INTO t(v) VALUES ('c{i}')"));
+    }
+    let mut db = open();
+    assert_rows(&mut db, "SELECT count(*), count(DISTINCT id), min(id) > 0 FROM t", &[vec![int(121), int(121), int(1)]]);
+    drop(db);
+    drop(guard);
+}
+
+#[test]
+fn autoincrement_after_max_rowid_is_database_full() {
+    // autoinc.html: with AUTOINCREMENT, once the largest rowid has been used "the next
+    // INSERT attempt fails with an SQLITE_FULL error". sqlite3 3.51.3 reports
+    // "database or disk is full", also after that row is deleted (sqlite_sequence keeps
+    // the high-water mark).
+    let mut db = mem();
+    exec(&mut db, "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v)");
+    exec(&mut db, "INSERT INTO t VALUES (9223372036854775807, 'max')");
+    let e = assert_exec_error(&mut db, "INSERT INTO t(v) VALUES ('next')");
+    assert!(e.to_string().contains("database or disk is full"), "got: {e}");
+    assert_scalar(&mut db, "SELECT count(*) FROM t", int(1));
+    exec(&mut db, "DELETE FROM t");
+    let e = assert_exec_error(&mut db, "INSERT INTO t(v) VALUES ('next')");
+    assert!(e.to_string().contains("database or disk is full"), "got: {e}");
+    assert_scalar(&mut db, "SELECT count(*) FROM t", int(0));
+}
+
+// ===========================================================================
 // 6) WITHOUT ROWID — lang_createtable.html §5 (PROBE).
 // "The rowid (and 'oid' and '_rowid_') is omitted in WITHOUT ROWID tables", so
 // referencing it is an error (no such column). WITHOUT ROWID may be
