@@ -9,6 +9,9 @@
 //! key to its key register and collects each aggregate call, returning a reference
 //! to its result register. Everything else lowers structurally.
 
+use std::borrow::Cow;
+
+use minisqlite_catalog::Catalog;
 use minisqlite_expr::{
     AggregateCall, ArithOp, BitOp, CaseWhen, CmpOp, CompareMeta, EvalExpr, LikeKind as IrLikeKind,
     NowKind, RaiseKind as IrRaiseKind, SortKey, UnaryOp as IrUnaryOp,
@@ -22,6 +25,8 @@ use minisqlite_sql::{
 use minisqlite_types::{affinity_of_declared_type, Affinity, Error, Result, Value};
 
 use crate::bind::scope::{parse_collation, Grouping, Scope};
+use crate::compile::cte::push_cte_schemas;
+use crate::compile::from::resolve_from;
 use crate::compile::select::{compile_row_subquery, compile_subquery, compile_value_subquery};
 use crate::compile::window::bind_window_function;
 use crate::plan_ctx::PlanCtx;
@@ -1150,8 +1155,8 @@ fn in_table_select_star(name: &QualifiedName, args: &[Expr]) -> Select {
 /// each subject element is bound in source order (so `?` parameters number left-to-right),
 /// the subquery is compiled and required to return exactly as many columns as the tuple is
 /// wide (else the SQLite `sub-select returns N columns - expected M` error), and element `i`
-/// carries its OWN `compare_meta_subject` metadata (RHS no-affinity, subject collation —
-/// §4.2/§7.1), exactly as the scalar `IN` path does. A scalar subject falls through to the
+/// carries its OWN `compare_meta_in_select` metadata (RHS no-affinity, and the §7.1
+/// collation of element `i` against result column `i`), exactly as the scalar `IN` path does. A scalar subject falls through to the
 /// ordinary `InList` / `InSubquery` paths below (a table / TVF among them, lowered to
 /// `InSubquery`).
 fn bind_in(
@@ -1167,16 +1172,25 @@ fn bind_in(
         // left-to-right parameter numbering. Metadata is per element (see doc above): a
         // shared meta would leak element 0's affinity/collation onto the others.
         //
-        // Like the scalar `InSubquery`/`InList` paths below, `compare_meta_subject` treats
-        // the RHS as no-affinity (subject collation only). datatype3.html §3.2 says the
-        // subquery column's result-set affinity should apply; threading it is a larger
-        // binder feature. This same approximation now lives at all THREE IN sites (here,
-        // and `InList`/`InSubquery` below) — whoever threads result-set affinity must fix
-        // all three, or the row path silently diverges from the scalar one.
+        // Like the scalar `InSubquery`/`InList` paths below, the RHS is treated as
+        // no-affinity. datatype3.html §3.2 says the subquery column's result-set affinity
+        // should apply; threading it is a larger binder feature. This same approximation
+        // now lives at all THREE IN sites (here, and `InList`/`InSubquery` below) — whoever
+        // threads result-set affinity must fix all three, or the row path silently diverges
+        // from the scalar one. The collation of element `i` follows §7.1 against the
+        // subquery's `i`-th result column ([`compare_meta_in_select`]).
+        let rhs_sel = match rhs {
+            InRhs::Select(sel) => Some(Cow::Borrowed(sel.as_ref())),
+            InRhs::Table { name, args } => Some(Cow::Owned(in_table_select_star(name, args))),
+            InRhs::List(_) => None,
+        };
         let mut subjects = Vec::with_capacity(elems.len());
         let mut metas = Vec::with_capacity(elems.len());
-        for elem in elems {
-            metas.push(compare_meta_subject(scope, elem)?);
+        for (i, elem) in elems.iter().enumerate() {
+            metas.push(match &rhs_sel {
+                Some(sel) => compare_meta_in_select(scope, ctx.catalog, elem, sel, i)?,
+                None => compare_meta_subject(scope, elem)?,
+            });
             subjects.push(bind_expr(scope, ctx, elem)?);
         }
         // The RHS must be a subquery — an explicit `(SELECT …)`, or a table / table-valued
@@ -1191,13 +1205,9 @@ fn bind_in(
         // malformed subject (e.g. an unknown column in the tuple) then surfaces its OWN
         // binding error first rather than being masked by the misuse message. Every valid
         // query, and the common `(a, b) IN (list)` case, is unaffected — both still error.
-        let id = match rhs {
-            InRhs::Select(sel) => compile_row_subquery(scope, ctx, sel, subjects.len())?,
-            InRhs::Table { name, args } => {
-                let sel = in_table_select_star(name, args);
-                compile_row_subquery(scope, ctx, &sel, subjects.len())?
-            }
-            InRhs::List(_) => return Err(Error::sql("row value misused")),
+        let id = match rhs_sel {
+            Some(sel) => compile_row_subquery(scope, ctx, &sel, subjects.len())?,
+            None => return Err(Error::sql("row value misused")),
         };
         return Ok(EvalExpr::InSubqueryRow { negated, subjects, id, metas });
     }
@@ -1214,7 +1224,7 @@ fn bind_in(
             EvalExpr::InList { negated, subject: Box::new(subject), items: bitems, meta }
         }
         InRhs::Select(sel) => {
-            let meta = compare_meta_subject(scope, subject_ast)?;
+            let meta = compare_meta_in_select(scope, ctx.catalog, subject_ast, sel, 0)?;
             let subject = bind_expr(scope, ctx, subject_ast)?;
             let id = compile_value_subquery(scope, ctx, sel)?;
             EvalExpr::InSubquery { negated, subject: Box::new(subject), id, meta }
@@ -1230,7 +1240,7 @@ fn bind_in(
         // matching SQLite. No second check, no column special-casing.
         InRhs::Table { name, args } => {
             let sel = in_table_select_star(name, args);
-            let meta = compare_meta_subject(scope, subject_ast)?;
+            let meta = compare_meta_in_select(scope, ctx.catalog, subject_ast, &sel, 0)?;
             let subject = bind_expr(scope, ctx, subject_ast)?;
             let id = compile_value_subquery(scope, ctx, &sel)?;
             EvalExpr::InSubquery { negated, subject: Box::new(subject), id, meta }
@@ -1589,12 +1599,100 @@ pub fn compare_meta(scope: &Scope, left: &Expr, right: &Expr) -> Result<CompareM
 /// §4.2 rule for `IN` — the RHS is genuine no-affinity (`CompareClass::NoAff`), which
 /// §4.2 states explicitly ("the values to the right of the IN operator ... are
 /// considered to have no affinity, even if they happen to be column values or CAST
-/// expressions").
+/// expressions"). The subquery form then picks its collation with
+/// [`compare_meta_in_select`].
 pub fn compare_meta_subject(scope: &Scope, subject: &Expr) -> Result<CompareMeta> {
     let lc = compare_class(operand_affinity(scope, subject)?);
     let (apply_left, apply_right) = apply_affinity_rule(lc, CompareClass::NoAff);
     let collation = resolve_collation(scope, subject, None)?;
     Ok(CompareMeta { apply_left, apply_right, collation })
+}
+
+/// Comparison metadata for `subject IN (SELECT ...)`, where `subject` is compared with
+/// result column `idx` of `sel` (0 for a scalar subject, the element index of a row value).
+///
+/// Affinity is as in [`compare_meta_subject`]. The collation is the §7.1 `x = y` rule with
+/// `y` the subquery's result expression ("x IN (SELECT y ...)" is handled in the same way
+/// as "x = y"): an explicit COLLATE on the subject, else one on `y`, else the subject's
+/// column collation, else `y`'s column collation, else BINARY. So a literal or computed
+/// subject takes the collation of the subquery column, as in sqlite3.
+pub fn compare_meta_in_select(
+    scope: &Scope,
+    catalog: &dyn Catalog,
+    subject: &Expr,
+    sel: &Select,
+    idx: usize,
+) -> Result<CompareMeta> {
+    let mut meta = compare_meta_subject(scope, subject)?;
+    if explicit_collation(subject)?.is_some() {
+        return Ok(meta);
+    }
+    if let Some((collation, explicit)) = subquery_result_collation(scope, catalog, sel, idx) {
+        if explicit || operand_column_collation(scope, subject)?.is_none() {
+            meta.collation = collation;
+        }
+    }
+    Ok(meta)
+}
+
+/// The collation result column `idx` of `sel` defines, with whether it comes from an
+/// explicit COLLATE (`true`) or from a column (`false`); `None` when it defines none.
+///
+/// sqlite3 reads this off the result expression of the LAST core of a compound, and a
+/// `VALUES` core defines none. The core's FROM is resolved catalog-only (as
+/// [`crate::compile::from::derived_schema`] does), with `scope` as the parent so a
+/// correlated reference resolves to the outer column. Best-effort: anything that does not
+/// resolve yields `None`, and compiling the subquery afterwards reports the real error.
+fn subquery_result_collation(
+    scope: &Scope,
+    catalog: &dyn Catalog,
+    sel: &Select,
+    idx: usize,
+) -> Option<(minisqlite_types::Collation, bool)> {
+    let _cte_guard = match &sel.with {
+        Some(with) => Some(push_cte_schemas(catalog, with).ok()?),
+        None => None,
+    };
+    let core = match &sel.body {
+        SelectBody::Select(core) => core,
+        SelectBody::Compound { right, .. } => right,
+    };
+    let SelectCore::Query { columns, from, .. } = core else {
+        return None;
+    };
+    let (sources, coalesced) = resolve_from(catalog, from, 0).ok()?;
+    let sub = Scope {
+        sources: &sources,
+        coalesced: &coalesced,
+        parent: Some(scope),
+        grouping: None,
+        saw_correlated: None,
+        correlated_cols: None,
+        nondeterministic: None,
+        windowing: None,
+    };
+    let mut rest = idx;
+    for col in columns {
+        let star = match col {
+            ResultColumn::Expr { expr, .. } if rest == 0 => {
+                if let Ok(Some(c)) = explicit_collation(expr) {
+                    return Some((c, true));
+                }
+                return operand_column_collation(&sub, expr).ok().flatten().map(|c| (c, false));
+            }
+            ResultColumn::Expr { .. } => {
+                rest -= 1;
+                continue;
+            }
+            ResultColumn::Star => sub.expand_star_cols(None).ok()?,
+            ResultColumn::TableStar(t) => sub.expand_star_cols(Some(t)).ok()?,
+        };
+        if let Some((_, _, c)) = star.get(rest) {
+            return Some((*c, false));
+        }
+        rest -= star.len();
+    }
+    None
 }
 
 /// The collation of a single operand (an explicit COLLATE, else a column's
